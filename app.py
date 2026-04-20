@@ -140,10 +140,10 @@ def build_network_html(G, partition):
 
 <script>
   var _originalColors = {{}};
-  var FADE_BG     = 'rgba(220,220,220,0.2)';
-  var FADE_BORDER = 'rgba(200,200,200,0.2)';
-  var FADE_FONT   = 'rgba(150,150,150,0.3)';
-  var FADE_EDGE   = 'rgba(220,220,220,0.1)';
+  var FADE_BG     = 'rgba(230,230,230,0.25)';
+  var FADE_BORDER = 'rgba(210,210,210,0.25)';
+  var FADE_FONT   = 'rgba(180,180,180,0.3)';
+  var FADE_EDGE   = 'rgba(230,230,230,0.1)';
 
   function _saveOriginal() {{
     if (typeof network === 'undefined') return false;
@@ -164,7 +164,7 @@ def build_network_html(G, partition):
       return {{ 
         id: n.id, 
         color: _originalColors[n.id].color, 
-        font: {{ color: "#333333" }} 
+        font: {{ color: "#333333", strokeWidth: 2, strokeColor: "#ffffff" }} 
       }};
     }});
     network.body.data.nodes.update(nodeUpdates);
@@ -180,14 +180,12 @@ def build_network_html(G, partition):
 
     var nodeUpdates = network.body.data.nodes.get().map(function(n) {{
       if (String(n.group) === clusterStr) {{
-        // RESTORE ORIGINAL CLUSTER COLOR
         return {{ 
             id: n.id, 
             color: _originalColors[n.id].color, 
             font: {{ color: "#333333", strokeWidth: 2, strokeColor: "#ffffff" }} 
         }};
       }} else {{
-        // APPLY GREY FADE
         return {{
           id: n.id,
           color: {{ background: FADE_BG, border: FADE_BORDER }},
@@ -215,7 +213,7 @@ def build_network_html(G, partition):
 
 
 # --- Streamlit UI ---
-st.sidebar.title("Map controls")
+st.sidebar.title("Map Controls")
 
 user_extra_stops = st.sidebar.text_area("Additional exclusion words (comma separated):", "")
 all_stops = set(DEFAULT_EXCLUSIONS + [
@@ -265,7 +263,6 @@ if uploaded_file:
                     if diff < best_diff:
                         best_diff, best_partition = diff, p
 
-                # Layout spacing
                 pos = nx.spring_layout(G, seed=42, k=3.5 / max(1, len(G.nodes) ** 0.5))
                 scale = 1000
                 for node, (x, y) in pos.items():
@@ -286,5 +283,18 @@ if uploaded_file:
                             unsafe_allow_html=True
                         )
 
+                # Generate the HTML
                 html_map = build_network_html(G, best_partition)
+                
+                # SIDEBAR EXPORT OPTION
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("Export Options")
+                st.sidebar.download_button(
+                    label="💾 Download Interactive Map (HTML)",
+                    data=html_map,
+                    file_name="semantic_relationship_map.html",
+                    mime="text/html"
+                )
+
+                # Display in App
                 st.components.v1.html(html_map, height=800)
