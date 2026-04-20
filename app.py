@@ -81,7 +81,7 @@ def build_network_html(G, partition):
                 "highlight": {"background": "#FF8000", "border": "#CC5500"},
             },
             size=node_size,
-            shape="dot", # Changed to dot for cleaner look
+            shape="dot",
             group=str(cluster),
             x=x, y=y,
             physics=False,
@@ -133,17 +133,17 @@ def build_network_html(G, partition):
     box-shadow:0 4px 15px rgba(0,0,0,0.15);
     display:flex;flex-wrap:wrap;justify-content:center;gap:6px;width:90%;">
   <span style="font-size:14px;font-weight:800;margin-right:10px;color:#333;display:flex;align-items:center;">
-    🎯 Highlight:
+    🎯 Highlight Cluster:
   </span>
   {buttons_html}
 </div>
 
 <script>
   var _originalColors = {{}};
-  var FADE_BG     = 'rgba(230,230,230,0.15)';
-  var FADE_BORDER = 'rgba(200,200,200,0.15)';
-  var FADE_FONT   = 'rgba(180,180,180,0.15)';
-  var FADE_EDGE   = 'rgba(220,220,220,0.05)';
+  var FADE_BG     = 'rgba(220,220,220,0.2)';
+  var FADE_BORDER = 'rgba(200,200,200,0.2)';
+  var FADE_FONT   = 'rgba(150,150,150,0.3)';
+  var FADE_EDGE   = 'rgba(220,220,220,0.1)';
 
   function _saveOriginal() {{
     if (typeof network === 'undefined') return false;
@@ -161,7 +161,11 @@ def build_network_html(G, partition):
   function showAll() {{
     if(!_saveOriginal()) return;
     var nodeUpdates = network.body.data.nodes.get().map(function(n) {{
-      return {{ id: n.id, color: _originalColors[n.id].color, font: _originalColors[n.id].font }};
+      return {{ 
+        id: n.id, 
+        color: _originalColors[n.id].color, 
+        font: {{ color: "#333333" }} 
+      }};
     }});
     network.body.data.nodes.update(nodeUpdates);
     var edgeUpdates = network.body.data.edges.get().map(function(e) {{
@@ -176,12 +180,18 @@ def build_network_html(G, partition):
 
     var nodeUpdates = network.body.data.nodes.get().map(function(n) {{
       if (String(n.group) === clusterStr) {{
-        return {{ id: n.id, color: _originalColors[n.id].color, font: _originalColors[n.id].font }};
+        // RESTORE ORIGINAL CLUSTER COLOR
+        return {{ 
+            id: n.id, 
+            color: _originalColors[n.id].color, 
+            font: {{ color: "#333333", strokeWidth: 2, strokeColor: "#ffffff" }} 
+        }};
       }} else {{
+        // APPLY GREY FADE
         return {{
           id: n.id,
           color: {{ background: FADE_BG, border: FADE_BORDER }},
-          font: {{ color: FADE_FONT }}
+          font: {{ color: FADE_FONT, strokeWidth: 0 }}
         }};
       }}
     }});
@@ -255,7 +265,7 @@ if uploaded_file:
                     if diff < best_diff:
                         best_diff, best_partition = diff, p
 
-                # INCREASED K for better spacing/visibility
+                # Layout spacing
                 pos = nx.spring_layout(G, seed=42, k=3.5 / max(1, len(G.nodes) ** 0.5))
                 scale = 1000
                 for node, (x, y) in pos.items():
