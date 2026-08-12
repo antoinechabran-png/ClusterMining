@@ -8,6 +8,7 @@ from pyvis.network import Network
 from collections import Counter
 import itertools
 import re
+import os
 import json
 import io
 import tempfile
@@ -44,10 +45,55 @@ CLUSTER_COLORS = [
     "#7B9E3E",  # 9
     "#D4724A",  # 10
 ]
-BORDER_COLORS = [
-    "#013848", "#7A5010", "#6B0020", "#2A6A2A", "#4A2A7A",
-    "#1A5A60", "#7A3A10", "#6A1A4A", "#3A5A00", "#7A2A00",
-]
+
+# ─── Color helpers ────────────────────────────────────────────────────────────
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(c * 2 for c in hex_color)
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+def darken_hex(hex_color, factor=0.4):
+    """Auto-derive a matching border shade from any color, default or custom."""
+    r, g, b = hex_to_rgb(hex_color)
+    r, g, b = int(r * (1 - factor)), int(g * (1 - factor)), int(b * (1 - factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def shade_rgb_str(hex_color, t):
+    """t in [0,1] — 0 lightens toward white, 1 darkens toward black, 0.5 ≈ original.
+    Used to give word-cloud words within a single focused cluster a readable
+    frequency-driven variation while staying in that cluster's hue family."""
+    r, g, b = hex_to_rgb(hex_color)
+    if t < 0.5:
+        f = (0.5 - t) * 2
+        r = r + (255 - r) * f * 0.65
+        g = g + (255 - g) * f * 0.65
+        b = b + (255 - b) * f * 0.65
+    else:
+        f = (t - 0.5) * 2
+        r = r * (1 - f * 0.55)
+        g = g * (1 - f * 0.55)
+        b = b * (1 - f * 0.55)
+    return f"rgb({int(r)},{int(g)},{int(b)})"
+
+def rgb_str(hex_color):
+    r, g, b = hex_to_rgb(hex_color)
+    return f"rgb({r},{g},{b})"
+
+# Readable, dataviz-friendly fonts for the word cloud. Values are relative
+# paths this app expects to find under a local "fonts/" folder — TTF files
+# aren't bundled here (no network access to fetch them), so add the actual
+# font files to your project for each entry you want to offer; anything
+# missing falls back to the WordCloud default automatically.
+FONT_OPTIONS = {
+    "Default": None,
+    "Inter":      "fonts/Inter-Regular.ttf",
+    "Open Sans":  "fonts/OpenSans-Regular.ttf",
+    "Roboto":     "fonts/Roboto-Regular.ttf",
+    "Lato":       "fonts/Lato-Regular.ttf",
+    "Montserrat": "fonts/Montserrat-Regular.ttf",
+    "Nunito":     "fonts/Nunito-Regular.ttf",
+}
 
 # ─── NLP ─────────────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -73,10 +119,8 @@ def preprocess(text, lemmatizer, custom_stops):
     ]
 
 # ─── Network builder ─────────────────────────────────────────────────────────
-def build_html(G, partition, word_freq, filename="semantic_map"):
+def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
     cluster_ids = sorted(set(partition.values()))
-    color_map  = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)]  for i, c in enumerate(cluster_ids)}
-    border_map = {c: BORDER_COLORS[i % len(BORDER_COLORS)]    for i, c in enumerate(cluster_ids)}
 
     net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="#333333")
 
@@ -95,7 +139,7 @@ def build_html(G, partition, word_freq, filename="semantic_map"):
         y       = G.nodes[node].get("y", 0)
         color = {
             "background": color_map[cluster],
-            "border":     border_map[cluster],
+            "border":     darken_hex(color_map[cluster]),
             "highlight":  {"background": "#FF8000", "border": "#CC5500"},
         }
         font = {"size": 13, "color": "#ffffff", "face": "Arial",
@@ -145,7 +189,7 @@ def build_html(G, partition, word_freq, filename="semantic_map"):
             key=lambda w: -word_freq.get(w, 0),
         )
         top = members[0].upper() if members else f"C{i+1}"
-        col = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+        col = color_map[c]
         legend_pills += (
             f'<div onclick="filterCluster({c})" '
             f'style="background:{col};color:#fff;padding:6px 14px;border-radius:20px;'
@@ -184,6 +228,14 @@ def build_html(G, partition, word_freq, filename="semantic_map"):
     style="background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
     cursor:pointer;font-size:12px;font-weight:bold;
     white-space:nowrap;user-select:none;margin-left:6px;">📷 PNG</div>
+  <span style="width:1px;height:20px;background:#ddd;margin:0 2px;"></span>
+  <input id="searchBox" type="text" placeholder="Search a word…"
+    onkeydown="if(event.key==='Enter'){{searchWord();}}"
+    style="border:1px solid #ddd;border-radius:20px;padding:6px 12px;font-size:12px;width:140px;outline:none;">
+  <div onclick="searchWord()"
+    style="background:#0085AF;color:#fff;padding:6px 12px;border-radius:20px;
+    cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;user-select:none;">🔍</div>
+  <span id="searchMsg" style="font-size:11px;color:#C62F4B;font-weight:bold;white-space:nowrap;"></span>
 </div>
 
 <script>
@@ -202,7 +254,7 @@ function showAll() {{
   network.body.data.nodes.update(
     Object.keys(NODE_META).map(function(id) {{
       var m = NODE_META[id];
-      return {{ id:id, color:m.color, font:m.font }};
+      return {{ id:id, color:m.color, font:m.font, borderWidth:2 }};
     }})
   );
   network.body.data.edges.update(
@@ -242,6 +294,35 @@ function filterCluster(cid) {{
   );
 }}
 
+function searchWord() {{
+  var msg = document.getElementById("searchMsg");
+  var q = document.getElementById("searchBox").value.trim().toLowerCase();
+  msg.textContent = "";
+  if (!q) return;
+
+  var ids = Object.keys(NODE_META);
+  var match = ids.find(function(id) {{ return id.toLowerCase() === q; }});
+  if (!match) {{
+    match = ids.find(function(id) {{ return id.toLowerCase().indexOf(q) !== -1; }});
+  }}
+
+  if (!match) {{
+    msg.textContent = "No result found";
+    return;
+  }}
+
+  showAll();
+  network.selectNodes([match]);
+  network.focus(match, {{
+    scale: 1.5,
+    animation: {{ duration: 700, easingFunction: "easeInOutQuad" }},
+  }});
+  network.body.data.nodes.update([{{ id: match, borderWidth: 5 }}]);
+  setTimeout(function() {{
+    network.body.data.nodes.update([{{ id: match, borderWidth: 2 }}]);
+  }}, 1600);
+}}
+
 function exportPNG() {{
   try {{
     var canvas = network.canvas.frame.canvas;
@@ -262,13 +343,12 @@ function exportPNG() {{
 
 
 # ─── Cluster bubbles (circle-packing) builder ────────────────────────────────
-def build_bubbles_html(word_freq, full_partition, cluster_ids, scope, filename="cluster_bubbles"):
+def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope, filename="cluster_bubbles"):
     """Force-directed, draggable bubble chart: each word is its own bubble,
     sized by frequency and colored by cluster, gently pulled toward its
     cluster's 'gravity well' but free to be dragged around. Replaces the old
     static circle-packing layout, which couldn't be interacted with and
     under-sized most word labels to invisibility."""
-    color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(cluster_ids)}
 
     if scope == "Entire sample":
         scopes = list(enumerate(cluster_ids))
@@ -527,6 +607,7 @@ with st.sidebar:
     min_edge   = st.slider("Min connection strength",      1, 20,  3)
     n_clusters = st.slider("Target number of clusters",    2, 10,  5)
     st.markdown("---")
+    st.caption("ℹ️ After adding words here, click **Generate map** again to regenerate the analysis for newly excluded words.")
     user_extra_stops = st.text_area("Extra exclusion words (comma-sep):", "")
 
 all_stops = set(
@@ -586,27 +667,51 @@ if uploaded_file:
             cluster_ids = sorted(set(best_p.values()))
 
             # ── Everything downstream (map html, word cloud, bubbles) only
-            #    needs word_freq / G / best_p / cluster_ids — precompute the
-            #    one expensive artifact (the map) now and stash it all in
-            #    session_state. Rendering below then runs on EVERY rerun
-            #    (including ones triggered by a selectbox change), not just
-            #    the run where the button was clicked. ──────────────────────
+            #    needs word_freq / G / best_p / cluster_ids — cache those and
+            #    nothing more. The map/bubbles HTML is now built at RENDER
+            #    time (below), not here, because it depends on the current
+            #    cluster color_map — which the color pickers can change on
+            #    later reruns without needing a fresh "Generate map" click. ──
             st.session_state["results"] = {
                 "word_freq": word_freq,
                 "G": G,
                 "best_p": best_p,
                 "cluster_ids": cluster_ids,
-                "html_map": build_html(G, best_p, word_freq, filename="semantic_map"),
+            }
+            # New analysis → reset custom cluster colors to the default
+            # palette (a prior custom pick may not even make sense if the
+            # number/order of clusters changed).
+            st.session_state["cluster_colors"] = {
+                cid: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, cid in enumerate(cluster_ids)
             }
 
-# ── Render from session_state — survives selectbox/slider reruns ────────────
+# ── Render from session_state — survives selectbox/slider/color-picker reruns
 if "results" in st.session_state:
     res = st.session_state["results"]
     word_freq   = res["word_freq"]
     G           = res["G"]
     best_p      = res["best_p"]
     cluster_ids = res["cluster_ids"]
-    html_map    = res["html_map"]
+
+    # ── Custom cluster colors ────────────────────────────────────────────────
+    with st.expander("🎨 Cluster colors", expanded=False):
+        st.caption("Pick a color per cluster — the map, cluster bubbles, and word cloud all update to match.")
+        picker_cols = st.columns(len(cluster_ids))
+        for i, cid in enumerate(cluster_ids):
+            top_word = max(
+                (w for w, c in best_p.items() if c == cid),
+                key=lambda w: word_freq[w],
+                default=f"Cluster {i+1}",
+            )
+            picked = picker_cols[i].color_picker(
+                f"C{i+1} · {top_word}",
+                value=st.session_state["cluster_colors"].get(cid, CLUSTER_COLORS[i % len(CLUSTER_COLORS)]),
+                key=f"color_cluster_{cid}",
+            )
+            st.session_state["cluster_colors"][cid] = picked
+
+    color_map = st.session_state["cluster_colors"]
+    html_map = build_html(G, best_p, word_freq, color_map, filename="semantic_map")
 
     # ── Cluster summary cards ───────────────────────────────────────────────
     st.markdown("### Cluster overview")
@@ -616,7 +721,7 @@ if "results" in st.session_state:
             [w for w, c in best_p.items() if c == cid],
             key=lambda w: -word_freq[w],
         )
-        col_bg = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+        col_bg = color_map[cid]
         card_cols[i].markdown(
             f"""<div style="background:{col_bg};color:#fff;padding:12px 10px;
                 border-radius:10px;border-left:5px solid rgba(0,0,0,0.2);">
@@ -652,21 +757,53 @@ if "results" in st.session_state:
 
     # ── Word cloud ───────────────────────────────────────────────────────────
     st.markdown("### ☁️ Word Cloud")
+    wc_col1, wc_col2 = st.columns([2, 1])
     cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-    cloud_scope = st.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
+    cloud_scope = wc_col1.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
+    font_choice = wc_col2.selectbox("Font", list(FONT_OPTIONS.keys()), key="cloud_font")
 
     if cloud_scope == "Entire sample":
         cloud_freqs = dict(word_freq)
+        focus_cid = None
     else:
         idx = int(cloud_scope.split(" ")[1]) - 1
-        cid = cluster_ids[idx]
-        cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == cid}
+        focus_cid = cluster_ids[idx]
+        cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == focus_cid}
 
     if cloud_freqs:
-        wc = WordCloud(
-            width=1100, height=550, background_color="white",
-            colormap="viridis", prefer_horizontal=0.9,
-        ).generate_from_frequencies(cloud_freqs)
+        font_path = FONT_OPTIONS[font_choice]
+        if font_path and not os.path.exists(font_path):
+            st.caption(f"⚠️ '{font_choice}' font file not found at `{font_path}` — using the default font instead. Add the .ttf there to enable it.")
+            font_path = None
+
+        wc_kwargs = dict(
+            width=1100, height=550, background_color="white", prefer_horizontal=0.9,
+        )
+        if font_path:
+            wc_kwargs["font_path"] = font_path
+
+        wc = WordCloud(**wc_kwargs).generate_from_frequencies(cloud_freqs)
+
+        # ── Recolor to match cluster colors, consistent with the map/bubbles.
+        if focus_cid is None:
+            # Entire sample: solid color per word's own cluster.
+            def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                cid = best_p.get(word)
+                return rgb_str(color_map.get(cid, "#999999"))
+        else:
+            # Single cluster focus: shades of that one cluster's color,
+            # darker for more frequent words — keeps everything readably
+            # within the cluster's hue instead of introducing new colors,
+            # while frequency is still visible at a glance.
+            base_color = color_map[focus_cid]
+            freqs = list(cloud_freqs.values())
+            fmin, fmax = min(freqs), max(freqs)
+            def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                f = cloud_freqs.get(word, fmin)
+                t = 0.5 if fmax == fmin else (f - fmin) / (fmax - fmin)
+                return shade_rgb_str(base_color, 0.3 + t * 0.55)
+
+        wc.recolor(color_func=_color_func, random_state=42)
 
         fig, ax = plt.subplots(figsize=(11, 5.5))
         ax.imshow(wc, interpolation="bilinear")
@@ -699,7 +836,7 @@ if "results" in st.session_state:
         "cluster_bubbles_all" if bubble_scope == "Entire sample"
         else f"cluster_bubbles_{bubble_scope.replace(' ', '_').lower()}"
     )
-    bubble_html = build_bubbles_html(word_freq, best_p, cluster_ids, bubble_scope, filename=bubble_fname)
+    bubble_html = build_bubbles_html(word_freq, best_p, cluster_ids, color_map, bubble_scope, filename=bubble_fname)
     if bubble_html:
         st.components.v1.html(bubble_html, height=650, scrolling=False)
         st.download_button(
