@@ -60,10 +60,16 @@ def preprocess(text, lemmatizer, custom_stops):
     text = text.lower()
     text = re.sub(r"\b(not|no|don't|can't|won't|never)\s+(\w+)", r"not_\2", text)
     tokens = re.findall(r"\b[a-z][a-z]+\b", text)
+    # Lemmatize FIRST, then filter — the exclusion list should match the word
+    # as it actually ends up counted/displayed (the lemma), not the raw
+    # inflected form it happened to take in the source text. Filtering on the
+    # raw token let plurals/verb forms of an excluded word slip through and
+    # then get lemmatized right back into the word you were trying to remove.
+    lemmas = (lemmatizer.lemmatize(t) for t in tokens)
     return [
-        lemmatizer.lemmatize(t)
-        for t in tokens
-        if t not in STOP_WORDS and t not in custom_stops and len(t) > 2
+        lemma
+        for lemma in lemmas
+        if lemma not in STOP_WORDS and lemma not in custom_stops and len(lemma) > 2
     ]
 
 # ─── Network builder ─────────────────────────────────────────────────────────
