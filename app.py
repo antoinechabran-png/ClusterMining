@@ -8,8 +8,12 @@ from pyvis.network import Network
 from collections import Counter
 import itertools
 import re
+import json
+import io
 import tempfile
 import community as community_louvain  # python-louvain
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
 
 # ─── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="English Semantic Explorer", layout="wide")
@@ -63,34 +67,46 @@ def preprocess(text, lemmatizer, custom_stops):
     ]
 
 # ─── Network builder ─────────────────────────────────────────────────────────
-def build_html(G, partition, word_freq):
+def build_html(G, partition, word_freq, filename="semantic_map"):
     cluster_ids = sorted(set(partition.values()))
     color_map  = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)]  for i, c in enumerate(cluster_ids)}
     border_map = {c: BORDER_COLORS[i % len(BORDER_COLORS)]    for i, c in enumerate(cluster_ids)}
 
     net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="#333333")
 
+    # Ground-truth per-node styling, computed once in Python. This — and NOT
+    # anything read back out of the live vis.js DataSet at click-time — is
+    # what the JS below uses to restore colors. Reading "originals" out of the
+    # rendered network after it may already have been mutated by a previous
+    # fade/highlight is what caused clusters after the first to render wrong
+    # and "All" to come back grey.
+    node_meta = {}
+
     for node in G.nodes():
         cluster = partition[node]
         freq    = G.nodes[node].get("size", 10)
         x       = G.nodes[node].get("x", 0)
         y       = G.nodes[node].get("y", 0)
+        color = {
+            "background": color_map[cluster],
+            "border":     border_map[cluster],
+            "highlight":  {"background": "#FF8000", "border": "#CC5500"},
+        }
+        font = {"size": 13, "color": "#ffffff", "face": "Arial",
+                "strokeWidth": 2, "strokeColor": "rgba(0,0,0,0.3)"}
+        node_meta[node] = {"color": color, "font": font, "group": str(cluster)}
+
         net.add_node(
             node,
             label=node,
             title=f"<b>{node}</b><br>Occurrences: {freq}<br>Cluster: {cluster + 1}",
-            color={
-                "background": color_map[cluster],
-                "border":     border_map[cluster],
-                "highlight":  {"background": "#FF8000", "border": "#CC5500"},
-            },
+            color=color,
             size=max(10, min(40, 10 + freq * 1.2)),
             shape="box",
             group=str(cluster),
             x=x, y=y,
             physics=False,
-            font={"size": 13, "color": "#ffffff", "face": "Arial",
-                  "strokeWidth": 2, "strokeColor": "rgba(0,0,0,0.3)"},
+            font=font,
             borderWidth=2,
             shadow={"enabled": True, "color": "rgba(0,0,0,0.15)", "size": 6, "x": 2, "y": 2},
         )
@@ -134,9 +150,13 @@ def build_html(G, partition, word_freq):
             f'</div>\n'
         )
 
-    # ── JS: store originals from node DATA (not live node objects) so
-    #        switching clusters always restores from the ground-truth snapshot,
-    #        never from an already-faded state.  ──────────────────────────────
+    # ── JS: NODE_META is authored once in Python and never mutated in JS.
+    #        showAll()/filterCluster() always reset from THIS, never from
+    #        whatever the live DataSet currently happens to show — so
+    #        switching clusters repeatedly, or hitting "All" after several
+    #        switches, always reproduces the correct original colors.  ───────
+    node_meta_json = json.dumps(node_meta)
+
     inject = f"""
 <!-- ═══ CLUSTER TOOLBAR ═══ -->
 <div id="ctoolbar" style="
@@ -154,22 +174,17 @@ def build_html(G, partition, word_freq):
     cursor:pointer;font-size:12px;font-weight:bold;border:1px solid #ddd;
     white-space:nowrap;user-select:none;">↺ All</div>
   {legend_pills}
+  <div onclick="exportPNG()"
+    style="background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
+    cursor:pointer;font-size:12px;font-weight:bold;
+    white-space:nowrap;user-select:none;margin-left:6px;">📷 PNG</div>
 </div>
 
 <script>
-// ── Ground-truth snapshot (filled once, never mutated) ──────────────────────
-var _GT = null;   // {{ nodeId: {{ color, font }} }}
-
-function _ensureGT() {{
-  if (_GT !== null) return;
-  _GT = {{}};
-  network.body.data.nodes.get().forEach(function(n) {{
-    _GT[n.id] = {{
-      color: JSON.parse(JSON.stringify(n.color || {{}})),
-      font:  JSON.parse(JSON.stringify(n.font  || {{}})),
-    }};
-  }});
-}}
+// ── Immutable ground truth, authored in Python — never derived from the
+//    live/rendered network, so it can never pick up a faded/highlighted
+//    state by accident. ───────────────────────────────────────────────────
+var NODE_META = {node_meta_json};   // {{ nodeId: {{ color, font, group }} }}
 
 var FADE_NODE = {{ background:"rgba(220,220,220,0.25)", border:"rgba(200,200,200,0.2)",
                    highlight:{{ background:"rgba(220,220,220,0.25)", border:"rgba(200,200,200,0.2)" }} }};
@@ -178,10 +193,10 @@ var DIM_EDGE  = "rgba(200,200,200,0.12)";
 var FULL_EDGE = "#c8d8e8";
 
 function showAll() {{
-  _ensureGT();
   network.body.data.nodes.update(
-    network.body.data.nodes.get().map(function(n) {{
-      return {{ id:n.id, color:_GT[n.id].color, font:_GT[n.id].font }};
+    Object.keys(NODE_META).map(function(id) {{
+      var m = NODE_META[id];
+      return {{ id:id, color:m.color, font:m.font }};
     }})
   );
   network.body.data.edges.update(
@@ -192,27 +207,27 @@ function showAll() {{
 }}
 
 function filterCluster(cid) {{
-  _ensureGT();
   var cs = String(cid);
 
-  // Build set of node-ids that belong to the target cluster
+  // Which node ids belong to the target cluster — from NODE_META, always.
   var inCluster = {{}};
-  network.body.data.nodes.get().forEach(function(n) {{
-    if (String(n.group) === cs) inCluster[n.id] = true;
+  Object.keys(NODE_META).forEach(function(id) {{
+    if (NODE_META[id].group === cs) inCluster[id] = true;
   }});
 
-  // Update nodes — always read from GT, never from current state
+  // Every node gets an explicit, fully-specified color/font on every call —
+  // selected nodes from NODE_META (true originals), everything else faded.
   network.body.data.nodes.update(
-    network.body.data.nodes.get().map(function(n) {{
-      if (inCluster[n.id]) {{
-        return {{ id:n.id, color:_GT[n.id].color, font:_GT[n.id].font }};
+    Object.keys(NODE_META).map(function(id) {{
+      var m = NODE_META[id];
+      if (inCluster[id]) {{
+        return {{ id:id, color:m.color, font:m.font }};
       }} else {{
-        return {{ id:n.id, color:FADE_NODE, font:FADE_FONT }};
+        return {{ id:id, color:FADE_NODE, font:FADE_FONT }};
       }}
     }})
   );
 
-  // Update edges
   network.body.data.edges.update(
     network.body.data.edges.get().map(function(e) {{
       var keep = inCluster[e.from] && inCluster[e.to];
@@ -220,9 +235,92 @@ function filterCluster(cid) {{
     }})
   );
 }}
+
+function exportPNG() {{
+  try {{
+    var canvas = network.canvas.frame.canvas;
+    var link = document.createElement("a");
+    link.download = "{filename}.png";
+    link.href = canvas.toDataURL("image/png");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }} catch (e) {{
+    alert("PNG export failed: " + e.message);
+  }}
+}}
 </script>
 """
     # Inject just before </body>
+    return html.replace("</body>", inject + "\n</body>")
+
+
+# ─── Word tree / relationship-tree builder ───────────────────────────────────
+def build_tree_html(G, word_freq, node_subset, title, filename="word_tree"):
+    """Hierarchical (root-out) view of how a set of words relate, built as a
+    maximum-spanning-tree of the co-occurrence graph restricted to node_subset."""
+    sub = G.subgraph(node_subset).copy()
+    if sub.number_of_nodes() < 2 or sub.number_of_edges() == 0:
+        return None
+
+    # Reduce to a tree so a hierarchical layout has something sensible to draw
+    tree = nx.maximum_spanning_tree(sub, weight="weight")
+    root = max(tree.nodes(), key=lambda n: word_freq.get(n, 0))
+
+    net = Network(height="550px", width="100%", bgcolor="#ffffff", font_color="#333333", directed=False)
+    net.set_options("""{
+      "layout": {"hierarchical": {"enabled": true, "direction": "UD",
+                  "sortMethod": "hubsize", "nodeSpacing": 140, "levelSeparation": 110}},
+      "physics": {"enabled": false},
+      "interaction": {"hover": true}
+    }""")
+
+    for node in tree.nodes():
+        freq = word_freq.get(node, 1)
+        is_root = node == root
+        net.add_node(
+            node,
+            label=node,
+            title=f"<b>{node}</b><br>Occurrences: {freq}",
+            color={
+                "background": "#0085AF" if is_root else "#6AAB6A",
+                "border": "#013848" if is_root else "#2A6A2A",
+            },
+            size=max(12, min(36, 12 + freq)),
+            shape="box",
+            font={"size": 13, "color": "#ffffff", "face": "Arial"},
+            borderWidth=2,
+        )
+    for u, v, data in tree.edges(data=True):
+        net.add_edge(u, v, value=data.get("weight", 1), color="#c8d8e8")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp:
+        net.save_graph(tmp.name)
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            html = f.read()
+
+    inject = f"""
+<div style="position:absolute; top:10px; right:14px; z-index:9999;">
+  <div onclick="exportTreePNG()"
+    style="background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
+    cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;user-select:none;">📷 PNG</div>
+</div>
+<script>
+function exportTreePNG() {{
+  try {{
+    var canvas = network.canvas.frame.canvas;
+    var link = document.createElement("a");
+    link.download = "{filename}.png";
+    link.href = canvas.toDataURL("image/png");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }} catch (e) {{
+    alert("PNG export failed: " + e.message);
+  }}
+}}
+</script>
+"""
     return html.replace("</body>", inject + "\n</body>")
 
 
@@ -321,7 +419,7 @@ if uploaded_file:
             st.markdown("<br>", unsafe_allow_html=True)
 
             # ── Build & render map ──────────────────────────────────────────
-            html_map = build_html(G, best_p, word_freq)
+            html_map = build_html(G, best_p, word_freq, filename="semantic_map")
 
             # Download button in sidebar
             st.sidebar.markdown("---")
@@ -334,3 +432,61 @@ if uploaded_file:
             )
 
             st.components.v1.html(html_map, height=750, scrolling=False)
+
+            # ── Word cloud ───────────────────────────────────────────────────
+            st.markdown("### ☁️ Word Cloud")
+            cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+            cloud_scope = st.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
+
+            if cloud_scope == "Entire sample":
+                cloud_freqs = dict(word_freq)
+            else:
+                idx = int(cloud_scope.split(" ")[1]) - 1
+                cid = cluster_ids[idx]
+                cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == cid}
+
+            if cloud_freqs:
+                wc = WordCloud(
+                    width=1100, height=550, background_color="white",
+                    colormap="viridis", prefer_horizontal=0.9,
+                ).generate_from_frequencies(cloud_freqs)
+
+                fig, ax = plt.subplots(figsize=(11, 5.5))
+                ax.imshow(wc, interpolation="bilinear")
+                ax.axis("off")
+                st.pyplot(fig)
+                plt.close(fig)
+
+                buf = io.BytesIO()
+                wc.to_image().save(buf, format="PNG")
+                st.download_button(
+                    "💾 Download word cloud (PNG)",
+                    data=buf.getvalue(),
+                    file_name=f"wordcloud_{cloud_scope.replace(' ', '_').lower()}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
+            else:
+                st.info("No words to display for this selection.")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Word tree / relationship tree ─────────────────────────────────
+            st.markdown("### 🌳 Word Tree")
+            tree_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+            tree_scope = st.selectbox("Show word tree for:", tree_options, key="tree_scope")
+
+            if tree_scope == "Entire sample":
+                tree_nodes = list(G.nodes())
+                tree_fname = "word_tree_all"
+            else:
+                idx = int(tree_scope.split(" ")[1]) - 1
+                cid = cluster_ids[idx]
+                tree_nodes = [w for w, c in best_p.items() if c == cid]
+                tree_fname = f"word_tree_cluster_{idx+1}"
+
+            tree_html = build_tree_html(G, word_freq, tree_nodes, tree_scope, filename=tree_fname)
+            if tree_html:
+                st.components.v1.html(tree_html, height=600, scrolling=False)
+            else:
+                st.info("Not enough connected words in this selection to build a tree.")
