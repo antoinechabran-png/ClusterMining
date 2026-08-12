@@ -257,43 +257,35 @@ function exportPNG() {{
 
 # ─── Cluster bubbles (circle-packing) builder ────────────────────────────────
 def build_bubbles_html(word_freq, full_partition, cluster_ids, scope, filename="cluster_bubbles"):
-    """Zoomable circle-packing chart: root → cluster → word, sized by frequency,
-    colored by cluster. Reflects the real cluster assignment directly (unlike a
-    spanning-tree cut of the co-occurrence graph, which needs a connected
-    subgraph and an arbitrary root)."""
+    """Force-directed, draggable bubble chart: each word is its own bubble,
+    sized by frequency and colored by cluster, gently pulled toward its
+    cluster's 'gravity well' but free to be dragged around. Replaces the old
+    static circle-packing layout, which couldn't be interacted with and
+    under-sized most word labels to invisibility."""
     color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(cluster_ids)}
 
     if scope == "Entire sample":
-        children = []
-        for i, cid in enumerate(cluster_ids):
-            members = [w for w, c in full_partition.items() if c == cid]
-            if not members:
-                continue
-            children.append({
-                "name": f"Cluster {i+1}",
-                "cluster": cid,
-                "children": [
-                    {"name": w, "value": max(1, int(word_freq.get(w, 1))), "cluster": cid}
-                    for w in members
-                ],
-            })
-        data = {"name": "root", "children": children}
+        scopes = list(enumerate(cluster_ids))
     else:
         idx = int(scope.split(" ")[1]) - 1
-        cid = cluster_ids[idx]
-        members = [w for w, c in full_partition.items() if c == cid]
-        if not members:
-            return None
-        data = {
-            "name": scope,
-            "cluster": cid,
-            "children": [
-                {"name": w, "value": max(1, int(word_freq.get(w, 1))), "cluster": cid}
-                for w in members
-            ],
-        }
+        scopes = [(idx, cluster_ids[idx])]
 
-    data_json  = json.dumps(data)
+    nodes = []
+    for i, cid in scopes:
+        members = [w for w, c in full_partition.items() if c == cid]
+        for w in members:
+            nodes.append({
+                "id": w,
+                "name": w,
+                "value": max(1, int(word_freq.get(w, 1))),
+                "cluster": cid,
+                "clusterLabel": f"Cluster {i+1}",
+            })
+
+    if not nodes:
+        return None
+
+    nodes_json  = json.dumps(nodes)
     colors_json = json.dumps(color_map)
 
     html = f"""
@@ -315,84 +307,174 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, scope, filename="
     cursor:pointer;font-weight:bold;white-space:nowrap;user-select:none;
   }}
   #toolbar div.btn.reset {{ background:#f0f0f0;color:#555;border:1px solid #ddd; }}
-  .bubble-label {{ pointer-events:none; font-weight:600; fill:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.35); }}
-  .group-label {{ pointer-events:none; font-weight:700; fill:#333; }}
-  circle {{ cursor:pointer; }}
+  .bubble-label {{ pointer-events:none; font-weight:600; fill:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.4); }}
+  .group-label {{ pointer-events:none; font-weight:700; fill:#555; letter-spacing:.04em; }}
+  circle.word {{ cursor:grab; }}
+  circle.word:active {{ cursor:grabbing; }}
+  #tooltip {{
+    position:absolute; z-index:10000; pointer-events:none; opacity:0;
+    background:rgba(30,30,30,0.94); color:#fff; padding:8px 12px; border-radius:8px;
+    font-size:12px; line-height:1.5; box-shadow:0 4px 16px rgba(0,0,0,0.25);
+    transition:opacity 0.12s ease; max-width:220px;
+  }}
+  #tooltip b {{ font-size:13px; }}
+  #tooltip .swatch {{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }}
 </style>
 </head>
 <body>
 <div id="wrap">
   <div id="toolbar">
-    <div class="btn reset" onclick="resetZoom()">↺ Reset view</div>
+    <div class="btn reset" onclick="resetView()">↺ Reset</div>
     <div class="btn" onclick="exportPNG()">📷 PNG</div>
   </div>
+  <div id="tooltip"></div>
   <svg id="viz"></svg>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
-var DATA   = {data_json};
+var NODES  = {nodes_json};
 var COLORS = {colors_json};
-var W = window.innerWidth, H = Math.max(window.innerHeight, 550);
+var W = window.innerWidth, H = Math.max(window.innerHeight, 560);
 
 var svg = d3.select("#viz").attr("width", W).attr("height", H)
             .attr("viewBox", [0, 0, W, H]);
 var g = svg.append("g");
+var tooltip = d3.select("#tooltip");
 
 var zoomBeh = d3.zoom().scaleExtent([0.3, 8]).on("zoom", function(ev) {{
   g.attr("transform", ev.transform);
 }});
 svg.call(zoomBeh);
 
-function resetZoom() {{
-  svg.transition().duration(400).call(zoomBeh.transform, d3.zoomIdentity);
+// ── Radius scale — floor kept high enough that short words almost always fit
+var maxFreq = d3.max(NODES, function(d) {{ return d.value; }}) || 1;
+var rScale = d3.scaleSqrt().domain([1, maxFreq]).range([16, 58]);
+NODES.forEach(function(d) {{ d.r = rScale(d.value); }});
+
+// ── Cluster "gravity well" centers, spread evenly around the canvas
+var clusterIds = Array.from(new Set(NODES.map(function(d) {{ return d.cluster; }})));
+var centers = {{}};
+if (clusterIds.length === 1) {{
+  centers[clusterIds[0]] = {{ x: W / 2, y: H / 2 }};
+}} else {{
+  var cx = W / 2, cy = H / 2, R = Math.min(W, H) * 0.33;
+  clusterIds.forEach(function(cid, i) {{
+    var angle = (i / clusterIds.length) * 2 * Math.PI - Math.PI / 2;
+    centers[cid] = {{ x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) }};
+  }});
 }}
 
-var root = d3.hierarchy(DATA)
-  .sum(function(d) {{ return d.value || 0; }})
-  .sort(function(a, b) {{ return b.value - a.value; }});
+// ── Approximate "zone" circle behind each cluster's bubbles (static, purely
+//    visual — real positions can drift slightly once dragged) ─────────────
+var zoneR = {{}};
+clusterIds.forEach(function(cid) {{
+  var members = NODES.filter(function(d) {{ return d.cluster === cid; }});
+  var area = members.reduce(function(s, d) {{ return s + d.r * d.r; }}, 0);
+  zoneR[cid] = Math.sqrt(area) * 1.5 + 24;
+}});
 
-var pack = d3.pack().size([W - 40, H - 60]).padding(function(d) {{ return d.depth === 1 ? 18 : 3; }});
-pack(root);
+if (clusterIds.length > 1) {{
+  g.selectAll("circle.zone")
+    .data(clusterIds)
+    .join("circle")
+    .attr("class", "zone")
+    .attr("cx", function(d) {{ return centers[d].x; }})
+    .attr("cy", function(d) {{ return centers[d].y; }})
+    .attr("r", function(d) {{ return zoneR[d]; }})
+    .attr("fill", function(d) {{ return (COLORS[d] || "#999999") + "14"; }})
+    .attr("stroke", function(d) {{ return (COLORS[d] || "#999999") + "55"; }})
+    .attr("stroke-width", 1.5);
 
-g.attr("transform", "translate(20,50)");
+  g.selectAll("text.group-label")
+    .data(clusterIds)
+    .join("text")
+    .attr("class", "group-label")
+    .attr("text-anchor", "middle")
+    .attr("x", function(d) {{ return centers[d].x; }})
+    .attr("y", function(d) {{ return centers[d].y - zoneR[d] - 10; }})
+    .style("font-size", "13px")
+    .text(function(d, i) {{ return NODES.find(function(n) {{ return n.cluster === d; }}).clusterLabel; }});
+}}
 
+// ── Word bubbles ────────────────────────────────────────────────────────
 var node = g.selectAll("g.node")
-  .data(root.descendants().slice(1))
+  .data(NODES)
   .join("g")
-  .attr("class", "node")
-  .attr("transform", function(d) {{ return "translate(" + d.x + "," + d.y + ")"; }});
+  .attr("class", "node");
 
 node.append("circle")
+  .attr("class", "word")
   .attr("r", function(d) {{ return d.r; }})
-  .attr("fill", function(d) {{
-    var c = COLORS[d.data.cluster] || "#999999";
-    return d.children ? c + "22" : c;
+  .attr("fill", function(d) {{ return COLORS[d.cluster] || "#999999"; }})
+  .attr("stroke", "rgba(0,0,0,0.18)")
+  .attr("stroke-width", 1)
+  .on("mouseenter", function(ev, d) {{
+    d3.select(this).attr("stroke", "#333").attr("stroke-width", 2);
+    tooltip.style("opacity", 1).html(
+      '<span class="swatch" style="background:' + (COLORS[d.cluster] || "#999") + '"></span>' +
+      '<b>' + d.name + '</b><br>Frequency: ' + d.value + '<br>' + d.clusterLabel
+    );
   }})
-  .attr("stroke", function(d) {{ return d.children ? (COLORS[d.data.cluster] || "#999999") : "rgba(0,0,0,0.15)"; }})
-  .attr("stroke-width", function(d) {{ return d.children ? 2 : 1; }})
-  .append("title")
-  .text(function(d) {{ return d.data.name + (d.children ? "" : " — " + d.data.value + " occurrences"); }});
+  .on("mousemove", function(ev) {{
+    var box = document.getElementById("wrap").getBoundingClientRect();
+    tooltip.style("left", (ev.clientX - box.left + 16) + "px")
+           .style("top",  (ev.clientY - box.top + 12) + "px");
+  }})
+  .on("mouseleave", function() {{
+    d3.select(this).attr("stroke", "rgba(0,0,0,0.18)").attr("stroke-width", 1);
+    tooltip.style("opacity", 0);
+  }});
 
-// Group (cluster) labels, placed above each cluster's bubble cluster
-node.filter(function(d) {{ return d.depth === 1 && d.children; }})
-  .append("text")
-  .attr("class", "group-label")
-  .attr("text-anchor", "middle")
-  .attr("y", function(d) {{ return -d.r - 8; }})
-  .style("font-size", function(d) {{ return Math.max(12, Math.min(16, d.r / 6)) + "px"; }})
-  .text(function(d) {{ return d.data.name; }});
+// ── Label: font-size fit to the bubble, falling back to truncation only
+//    when even the smallest readable size can't fit the whole word ────────
+function fitLabel(d) {{
+  var usable = d.r * 1.7;
+  var estCharW = 0.62;
+  var size = Math.min(15, Math.max(8, usable / (d.name.length * estCharW)));
+  var maxChars = Math.max(3, Math.floor(usable / (size * estCharW)));
+  var text = d.name.length > maxChars ? d.name.slice(0, maxChars - 1) + "…" : d.name;
+  return {{ size: size, text: text }};
+}}
 
-// Word labels, only where the bubble is big enough to hold text
-node.filter(function(d) {{ return !d.children && d.r > 14; }})
-  .append("text")
+node.append("text")
   .attr("class", "bubble-label")
   .attr("text-anchor", "middle")
   .attr("dy", "0.32em")
-  .style("font-size", function(d) {{ return Math.max(9, Math.min(15, d.r / 2.6)) + "px"; }})
-  .text(function(d) {{
-    var maxChars = Math.max(3, Math.floor(d.r / 4));
-    return d.data.name.length > maxChars ? d.data.name.slice(0, maxChars - 1) + "…" : d.data.name;
-  }});
+  .style("font-size", function(d) {{ return fitLabel(d).size + "px"; }})
+  .text(function(d) {{ return fitLabel(d).text; }});
+
+// ── Force simulation: cluster gravity + collision + light repulsion ───────
+var simulation = d3.forceSimulation(NODES)
+  .force("x", d3.forceX(function(d) {{ return centers[d.cluster].x; }}).strength(0.08))
+  .force("y", d3.forceY(function(d) {{ return centers[d.cluster].y; }}).strength(0.08))
+  .force("collide", d3.forceCollide(function(d) {{ return d.r + 2; }}).strength(0.9))
+  .force("charge", d3.forceManyBody().strength(-1))
+  .on("tick", ticked);
+
+function ticked() {{
+  node.attr("transform", function(d) {{ return "translate(" + d.x + "," + d.y + ")"; }});
+}}
+
+node.call(
+  d3.drag()
+    .on("start", function(ev, d) {{
+      if (!ev.active) simulation.alphaTarget(0.25).restart();
+      d.fx = d.x; d.fy = d.y;
+    }})
+    .on("drag", function(ev, d) {{
+      d.fx = ev.x; d.fy = ev.y;
+    }})
+    .on("end", function(ev, d) {{
+      if (!ev.active) simulation.alphaTarget(0);
+      d.fx = null; d.fy = null;
+    }})
+);
+
+function resetView() {{
+  svg.transition().duration(400).call(zoomBeh.transform, d3.zoomIdentity);
+  NODES.forEach(function(d) {{ d.fx = null; d.fy = null; }});
+  simulation.alpha(0.6).restart();
+}}
 
 function exportPNG() {{
   var svgEl = document.getElementById("viz");
@@ -427,6 +509,7 @@ function exportPNG() {{
 </html>
 """
     return html
+
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
@@ -602,7 +685,7 @@ if "results" in st.session_state:
 
     # ── Cluster bubbles (circle-packing, replaces the old word tree) ─────────
     st.markdown("### 🔵 Cluster Bubbles")
-    st.caption("Word size = frequency · color = cluster · scroll to zoom, drag to pan")
+    st.caption("Word size = frequency · color = cluster · drag a bubble to move it · scroll/drag background to zoom & pan")
     bubble_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
     bubble_scope = st.selectbox("Show bubbles for:", bubble_options, key="bubble_scope")
 
