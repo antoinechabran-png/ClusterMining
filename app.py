@@ -813,6 +813,12 @@ function exportPNG() {{
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.warning(
+        "⚠️ This verbatim analysis suite is designed for **non-fragrance-related** text, "
+        "or **huge batches of aggregated verbatims** (e.g. thousands). For fragrance / "
+        "fragrance test analysis, please use **Text-Mining** or **Verbatim Studio** instead.",
+        icon="⚠️",
+    )
     st.title("⚙️ Settings")
     uploaded_file = st.file_uploader("📂 Upload Excel corpus", type=["xlsx"])
     st.markdown("---")
@@ -1045,29 +1051,6 @@ if "results" in st.session_state:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Sentiment by cluster ────────────────────────────────────────────────
-    if word_sent:
-        st.markdown("### 😊 Sentiment by Cluster")
-        st.caption("Average VADER sentiment of respondent rows mentioning each cluster's words (−1 = negative, +1 = positive).")
-        sent_rows = []
-        for i, cid in enumerate(cluster_ids):
-            members = [w for w, c in best_p.items() if c == cid]
-            s = cluster_avg_sentiment(members, word_freq, word_sent)
-            sent_rows.append((f"C{i+1} · {display_label(max(members, key=lambda w: word_freq[w]))}" if members else f"C{i+1}", s or 0.0))
-        fig, ax = plt.subplots(figsize=(9, max(1.6, 0.5 * len(sent_rows))))
-        labels = [r[0] for r in sent_rows]
-        scores = [r[1] for r in sent_rows]
-        bar_colors = [sentiment_to_color(s) for s in scores]
-        ax.barh(labels, scores, color=bar_colors)
-        ax.axvline(0, color="#333", linewidth=0.8)
-        ax.set_xlim(-1, 1)
-        ax.set_xlabel("Average sentiment")
-        ax.invert_yaxis()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
     # Download button in sidebar — now stable across reruns since html_map
     # comes from session_state rather than only existing mid-button-click.
     st.sidebar.markdown("---")
@@ -1080,271 +1063,292 @@ if "results" in st.session_state:
         key="download_map_html",
     )
 
-    st.components.v1.html(html_map, height=750, scrolling=False)
-
-    # ── Word cloud ───────────────────────────────────────────────────────────
-    st.markdown("### ☁️ Word Cloud")
-    wc_col1, wc_col2 = st.columns([2, 1])
-    cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-    cloud_scope = wc_col1.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
-    font_choice = wc_col2.selectbox("Font", list(FONT_OPTIONS.keys()), key="cloud_font")
-
-    if cloud_scope == "Entire sample":
-        cloud_freqs = {w: size_map.get(w, word_freq[w]) for w in word_freq}
-        focus_cid = None
-    else:
-        idx = int(cloud_scope.split(" ")[1]) - 1
-        focus_cid = cluster_ids[idx]
-        cloud_freqs = {w: size_map.get(w, word_freq[w]) for w, c in best_p.items() if c == focus_cid}
-
-    if cloud_freqs:
-        font_path = FONT_OPTIONS[font_choice]
-        if font_path and not os.path.exists(font_path):
-            st.caption(f"⚠️ '{font_choice}' font file not found at `{font_path}` — using the default font instead. Add the .ttf there to enable it.")
-            font_path = None
-
-        # WordCloud needs the words it displays as keys — swap in display
-        # labels (spaces instead of underscores for phrase tokens) here, and
-        # keep a reverse lookup so the color function can still find each
-        # word's original cluster/frequency data.
-        display_freqs = {display_label(w): v for w, v in cloud_freqs.items()}
-        disp_to_orig = {display_label(w): w for w in cloud_freqs}
-
-        wc_kwargs = dict(
-            width=1100, height=550, background_color="white", prefer_horizontal=0.9,
-        )
-        if font_path:
-            wc_kwargs["font_path"] = font_path
-
-        wc = WordCloud(**wc_kwargs).generate_from_frequencies(display_freqs)
-
-        # ── Recolor to match cluster colors, consistent with the map/bubbles.
-        if focus_cid is None:
-            # Entire sample: solid color per word's own cluster.
-            def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
-                orig = disp_to_orig.get(word, word)
-                cid = best_p.get(orig)
-                return rgb_str(color_map.get(cid, "#999999"))
-        else:
-            # Single cluster focus: shades of that one cluster's color,
-            # darker for more frequent/weighted words — keeps everything
-            # readably within the cluster's hue instead of introducing new
-            # colors, while relative importance is still visible at a glance.
-            base_color = color_map[focus_cid]
-            freqs = list(cloud_freqs.values())
-            fmin, fmax = min(freqs), max(freqs)
-            def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
-                orig = disp_to_orig.get(word, word)
-                f = cloud_freqs.get(orig, fmin)
-                t = 0.5 if fmax == fmin else (f - fmin) / (fmax - fmin)
-                return shade_rgb_str(base_color, 0.3 + t * 0.55)
-
-        wc.recolor(color_func=_color_func, random_state=42)
-
-        fig, ax = plt.subplots(figsize=(11, 5.5))
-        ax.imshow(wc, interpolation="bilinear")
-        ax.axis("off")
-        st.pyplot(fig)
-        plt.close(fig)
-
-        buf = io.BytesIO()
-        wc.to_image().save(buf, format="PNG")
-        st.download_button(
-            "💾 Download word cloud (PNG)",
-            data=buf.getvalue(),
-            file_name=f"wordcloud_{cloud_scope.replace(' ', '_').lower()}.png",
-            mime="image/png",
-            use_container_width=True,
-            key="download_wordcloud_png",
-        )
-    else:
-        st.info("No words to display for this selection.")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Cluster bubbles (circle-packing, replaces the old word tree) ─────────
-    st.markdown("### 🔵 Cluster Bubbles")
-    st.caption("Word size = frequency (or TF-IDF, if enabled) · color = cluster · drag a bubble to move it · scroll/drag background to zoom & pan")
-    bubble_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-    bubble_scope = st.selectbox("Show bubbles for:", bubble_options, key="bubble_scope")
-
-    bubble_fname = (
-        "cluster_bubbles_all" if bubble_scope == "Entire sample"
-        else f"cluster_bubbles_{bubble_scope.replace(' ', '_').lower()}"
-    )
-    bubble_html = build_bubbles_html(
-        word_freq, best_p, cluster_ids, color_map, bubble_scope,
-        size_map=size_map, word_sent=word_sent, filename=bubble_fname,
-    )
-    if bubble_html:
-        st.components.v1.html(bubble_html, height=650, scrolling=False)
-        st.download_button(
-            "💾 Download cluster bubbles (HTML)",
-            data=bubble_html,
-            file_name=f"{bubble_fname}.html",
-            mime="text/html",
-            use_container_width=True,
-            key="download_bubbles_html",
-        )
-    else:
-        st.info("No words to display for this selection.")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Group comparison & diff view ─────────────────────────────────────────
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+    tab_labels = ["🌐 Interactive Map", "🔵 Cluster Bubbles", "☁️ Word Cloud", "🔬 Drill-Down"]
     if group_freqs:
-        st.markdown("### 🔀 Group Comparison & Diff View")
-        gnames = list(group_freqs.keys())
-        if len(gnames) < 2:
-            st.info(f"Only one group value found in '{group_col}' — need at least two to compare.")
+        tab_labels.append("🔀 Group Comparison")
+    tabs = st.tabs(tab_labels)
+
+    # ── Tab 1: Interactive Map + Sentiment by Cluster ───────────────────────
+    with tabs[0]:
+        st.components.v1.html(html_map, height=750, scrolling=False)
+
+        if word_sent:
+            st.markdown("### 😊 Sentiment by Cluster")
+            st.caption("Average VADER sentiment of respondent rows mentioning each cluster's words (−1 = negative, +1 = positive).")
+            sent_rows = []
+            for i, cid in enumerate(cluster_ids):
+                members = [w for w, c in best_p.items() if c == cid]
+                s = cluster_avg_sentiment(members, word_freq, word_sent)
+                sent_rows.append((f"C{i+1} · {display_label(max(members, key=lambda w: word_freq[w]))}" if members else f"C{i+1}", s or 0.0))
+            fig, ax = plt.subplots(figsize=(9, max(1.6, 0.5 * len(sent_rows))))
+            labels = [r[0] for r in sent_rows]
+            scores = [r[1] for r in sent_rows]
+            bar_colors = [sentiment_to_color(s) for s in scores]
+            ax.barh(labels, scores, color=bar_colors)
+            ax.axvline(0, color="#333", linewidth=0.8)
+            ax.set_xlim(-1, 1)
+            ax.set_xlabel("Average sentiment")
+            ax.invert_yaxis()
+            st.pyplot(fig)
+            plt.close(fig)
+
+    # ── Tab 2: Cluster Bubbles ────────────────────────────────────────────────
+    with tabs[1]:
+        st.caption("Word size = frequency (or TF-IDF, if enabled) · color = cluster · drag a bubble to move it · scroll/drag background to zoom & pan")
+        bubble_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+        bubble_scope = st.selectbox("Show bubbles for:", bubble_options, key="bubble_scope")
+
+        bubble_fname = (
+            "cluster_bubbles_all" if bubble_scope == "Entire sample"
+            else f"cluster_bubbles_{bubble_scope.replace(' ', '_').lower()}"
+        )
+        bubble_html = build_bubbles_html(
+            word_freq, best_p, cluster_ids, color_map, bubble_scope,
+            size_map=size_map, word_sent=word_sent, filename=bubble_fname,
+        )
+        if bubble_html:
+            st.components.v1.html(bubble_html, height=650, scrolling=False)
+            st.download_button(
+                "💾 Download cluster bubbles (HTML)",
+                data=bubble_html,
+                file_name=f"{bubble_fname}.html",
+                mime="text/html",
+                use_container_width=True,
+                key="download_bubbles_html",
+            )
         else:
-            gc1, gc2 = st.columns(2)
-            group_a = gc1.selectbox("Group A", gnames, index=0, key="diff_group_a")
-            default_b_idx = 1 if len(gnames) > 1 else 0
-            group_b = gc2.selectbox("Group B", gnames, index=default_b_idx, key="diff_group_b")
+            st.info("No words to display for this selection.")
 
-            if group_a == group_b:
-                st.info("Pick two different groups to compare.")
+    # ── Tab 3: Word Cloud ────────────────────────────────────────────────────
+    with tabs[2]:
+        wc_col1, wc_col2 = st.columns([2, 1])
+        cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+        cloud_scope = wc_col1.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
+        font_choice = wc_col2.selectbox("Font", list(FONT_OPTIONS.keys()), key="cloud_font")
+
+        if cloud_scope == "Entire sample":
+            cloud_freqs = {w: size_map.get(w, word_freq[w]) for w in word_freq}
+            focus_cid = None
+        else:
+            idx = int(cloud_scope.split(" ")[1]) - 1
+            focus_cid = cluster_ids[idx]
+            cloud_freqs = {w: size_map.get(w, word_freq[w]) for w, c in best_p.items() if c == focus_cid}
+
+        if cloud_freqs:
+            font_path = FONT_OPTIONS[font_choice]
+            if font_path and not os.path.exists(font_path):
+                st.caption(f"⚠️ '{font_choice}' font file not found at `{font_path}` — using the default font instead. Add the .ttf there to enable it.")
+                font_path = None
+
+            # WordCloud needs the words it displays as keys — swap in display
+            # labels (spaces instead of underscores for phrase tokens) here, and
+            # keep a reverse lookup so the color function can still find each
+            # word's original cluster/frequency data.
+            display_freqs = {display_label(w): v for w, v in cloud_freqs.items()}
+            disp_to_orig = {display_label(w): w for w in cloud_freqs}
+
+            wc_kwargs = dict(
+                width=1100, height=550, background_color="white", prefer_horizontal=0.9,
+            )
+            if font_path:
+                wc_kwargs["font_path"] = font_path
+
+            wc = WordCloud(**wc_kwargs).generate_from_frequencies(display_freqs)
+
+            # ── Recolor to match cluster colors, consistent with the map/bubbles.
+            if focus_cid is None:
+                # Entire sample: solid color per word's own cluster.
+                def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                    orig = disp_to_orig.get(word, word)
+                    cid = best_p.get(orig)
+                    return rgb_str(color_map.get(cid, "#999999"))
             else:
-                freqs_a, freqs_b = group_freqs[group_a], group_freqs[group_b]
-                total_a = sum(freqs_a.values()) or 1
-                total_b = sum(freqs_b.values()) or 1
-                eps = 0.5
-                diffs = []
-                for w in set(freqs_a) | set(freqs_b):
-                    a, b = freqs_a.get(w, 0), freqs_b.get(w, 0)
-                    if a + b < 3:
-                        continue
-                    rate_a = (a + eps) / (total_a + eps)
-                    rate_b = (b + eps) / (total_b + eps)
-                    diffs.append((w, math.log2(rate_a / rate_b), a, b))
-                diffs.sort(key=lambda x: x[1])
+                # Single cluster focus: shades of that one cluster's color,
+                # darker for more frequent/weighted words — keeps everything
+                # readably within the cluster's hue instead of introducing new
+                # colors, while relative importance is still visible at a glance.
+                base_color = color_map[focus_cid]
+                freqs = list(cloud_freqs.values())
+                fmin, fmax = min(freqs), max(freqs)
+                def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                    orig = disp_to_orig.get(word, word)
+                    f = cloud_freqs.get(orig, fmin)
+                    t = 0.5 if fmax == fmin else (f - fmin) / (fmax - fmin)
+                    return shade_rgb_str(base_color, 0.3 + t * 0.55)
 
-                if not diffs:
-                    st.info("Not enough overlapping vocabulary between these two groups to compare.")
-                else:
-                    top_b = diffs[:12]
-                    top_a = list(reversed(diffs[-12:]))
-                    plot_rows = top_a + top_b
-                    labels = [display_label(w) for w, _, _, _ in plot_rows]
-                    scores = [s for _, s, _, _ in plot_rows]
-                    bar_colors = ["#0085AF" if s > 0 else "#C62F4B" for s in scores]
+            wc.recolor(color_func=_color_func, random_state=42)
 
-                    fig, ax = plt.subplots(figsize=(9, max(3, 0.32 * len(plot_rows))))
-                    y = list(range(len(plot_rows)))
-                    ax.barh(y, scores, color=bar_colors)
-                    ax.set_yticks(y)
-                    ax.set_yticklabels(labels, fontsize=9)
-                    ax.invert_yaxis()
-                    ax.axvline(0, color="#333", linewidth=0.8)
-                    ax.set_xlabel(f"← more typical of {group_b}     |     more typical of {group_a} →")
-                    ax.set_title(f"Word usage skew: {group_a} vs {group_b}")
-                    st.pyplot(fig)
-                    plt.close(fig)
+            fig, ax = plt.subplots(figsize=(11, 5.5))
+            ax.imshow(wc, interpolation="bilinear")
+            ax.axis("off")
+            st.pyplot(fig)
+            plt.close(fig)
 
-                wc_a, wc_b = st.columns(2)
-                wc_a.markdown(f"**Top words — {group_a}** ({group_counts[group_a]} rows)")
-                wc_a.dataframe(
-                    pd.DataFrame(freqs_a.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
-                    hide_index=True, use_container_width=True,
+            buf = io.BytesIO()
+            wc.to_image().save(buf, format="PNG")
+            st.download_button(
+                "💾 Download word cloud (PNG)",
+                data=buf.getvalue(),
+                file_name=f"wordcloud_{cloud_scope.replace(' ', '_').lower()}.png",
+                mime="image/png",
+                use_container_width=True,
+                key="download_wordcloud_png",
+            )
+        else:
+            st.info("No words to display for this selection.")
+
+    # ── Tab 4: Hierarchical Drill-Down + Respondent-level Drill-down ────────
+    with tabs[3]:
+        st.markdown("### 🔬 Hierarchical Drill-Down")
+        st.caption("Zoom into one cluster and re-run clustering on just its words to reveal sub-structure.")
+        drill_options = ["None"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+        drill_choice = st.selectbox("Drill into:", drill_options, key="drill_choice")
+
+        if drill_choice != "None":
+            idx = int(drill_choice.split(" ")[1]) - 1
+            cid = cluster_ids[idx]
+            members = [w for w, c in best_p.items() if c == cid]
+            subG = G.subgraph(members).copy()
+
+            if subG.number_of_nodes() < 4 or subG.number_of_edges() < 2:
+                st.info("Not enough internal structure in this cluster to sub-divide.")
+            else:
+                sub_partition = community_louvain.best_partition(subG, random_state=0)
+                sub_ids = sorted(set(sub_partition.values()))
+                sub_color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(sub_ids)}
+
+                st.write(f"**{drill_choice}** split into {len(sub_ids)} sub-groups:")
+                sub_cols = st.columns(len(sub_ids))
+                for i, scid in enumerate(sub_ids):
+                    smembers = sorted([w for w, c in sub_partition.items() if c == scid], key=lambda w: -word_freq.get(w, 0))
+                    sub_cols[i].markdown(
+                        f"""<div style="background:{sub_color_map[scid]};color:#fff;padding:8px;border-radius:8px;font-size:.75em;">
+                        <b>{display_label(smembers[0]).upper() if smembers else '—'}</b><br>{", ".join(display_label(w) for w in smembers[1:5])}
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                sub_html = build_html(
+                    subG, sub_partition, word_freq, sub_color_map,
+                    size_map=size_map, word_sent=word_sent,
+                    filename=f"drilldown_{drill_choice.replace(' ', '_').lower()}",
                 )
-                wc_b.markdown(f"**Top words — {group_b}** ({group_counts[group_b]} rows)")
-                wc_b.dataframe(
-                    pd.DataFrame(freqs_b.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
-                    hide_index=True, use_container_width=True,
+                st.components.v1.html(sub_html, height=520, scrolling=False)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown("### 🔎 Respondent-level Drill-down")
+        if resp_df is not None and text_col is not None:
+            all_words = sorted(G.nodes(), key=lambda w: -word_freq.get(w, 0))
+            pick_word = st.selectbox(
+                "Show verbatims containing:",
+                all_words,
+                format_func=display_label,
+                key="drilldown_word",
+            )
+            mask = resp_df["tokens"].apply(lambda toks: pick_word in toks)
+            matches = resp_df.loc[mask]
+            st.write(f"**{len(matches)}** respondent(s) mention *{display_label(pick_word)}*")
+            show_cols = [text_col] + ([group_col] if group_col else [])
+            st.dataframe(matches[show_cols], use_container_width=True, height=300)
+            if len(matches):
+                csv_buf = matches[show_cols].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "💾 Download matching verbatims (CSV)",
+                    data=csv_buf,
+                    file_name=f"verbatims_{pick_word}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_verbatims_csv",
                 )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Hierarchical drill-down ──────────────────────────────────────────────
-    st.markdown("### 🔬 Hierarchical Drill-Down")
-    st.caption("Zoom into one cluster and re-run clustering on just its words to reveal sub-structure.")
-    drill_options = ["None"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-    drill_choice = st.selectbox("Drill into:", drill_options, key="drill_choice")
+        st.markdown("### 🔗 Word Co-occurrence Table")
+        edge_rows = [
+            {"word_1": display_label(u), "word_2": display_label(v), "co_occurrences": d.get("weight", 1)}
+            for u, v, d in G.edges(data=True)
+        ]
+        edge_df = pd.DataFrame(edge_rows).sort_values("co_occurrences", ascending=False).reset_index(drop=True)
+        st.dataframe(edge_df, use_container_width=True, height=300)
 
-    if drill_choice != "None":
-        idx = int(drill_choice.split(" ")[1]) - 1
-        cid = cluster_ids[idx]
-        members = [w for w, c in best_p.items() if c == cid]
-        subG = G.subgraph(members).copy()
+        freq_df = pd.DataFrame(
+            [{"word": display_label(w), "frequency": word_freq[w], "cluster": best_p[w] + 1} for w in G.nodes()]
+        ).sort_values("frequency", ascending=False).reset_index(drop=True)
 
-        if subG.number_of_nodes() < 4 or subG.number_of_edges() < 2:
-            st.info("Not enough internal structure in this cluster to sub-divide.")
-        else:
-            sub_partition = community_louvain.best_partition(subG, random_state=0)
-            sub_ids = sorted(set(sub_partition.values()))
-            sub_color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(sub_ids)}
-
-            st.write(f"**{drill_choice}** split into {len(sub_ids)} sub-groups:")
-            sub_cols = st.columns(len(sub_ids))
-            for i, scid in enumerate(sub_ids):
-                smembers = sorted([w for w, c in sub_partition.items() if c == scid], key=lambda w: -word_freq.get(w, 0))
-                sub_cols[i].markdown(
-                    f"""<div style="background:{sub_color_map[scid]};color:#fff;padding:8px;border-radius:8px;font-size:.75em;">
-                    <b>{display_label(smembers[0]).upper() if smembers else '—'}</b><br>{", ".join(display_label(w) for w in smembers[1:5])}
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            sub_html = build_html(
-                subG, sub_partition, word_freq, sub_color_map,
-                size_map=size_map, word_sent=word_sent,
-                filename=f"drilldown_{drill_choice.replace(' ', '_').lower()}",
-            )
-            st.components.v1.html(sub_html, height=520, scrolling=False)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Word co-occurrence table / export ────────────────────────────────────
-    st.markdown("### 🔗 Word Co-occurrence Table")
-    edge_rows = [
-        {"word_1": display_label(u), "word_2": display_label(v), "co_occurrences": d.get("weight", 1)}
-        for u, v, d in G.edges(data=True)
-    ]
-    edge_df = pd.DataFrame(edge_rows).sort_values("co_occurrences", ascending=False).reset_index(drop=True)
-    st.dataframe(edge_df, use_container_width=True, height=300)
-
-    freq_df = pd.DataFrame(
-        [{"word": display_label(w), "frequency": word_freq[w], "cluster": best_p[w] + 1} for w in G.nodes()]
-    ).sort_values("frequency", ascending=False).reset_index(drop=True)
-
-    xlsx_buf = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-        edge_df.to_excel(writer, index=False, sheet_name="co_occurrences")
-        freq_df.to_excel(writer, index=False, sheet_name="word_frequency")
-    st.download_button(
-        "💾 Download co-occurrence data (XLSX)",
-        data=xlsx_buf.getvalue(),
-        file_name="word_cooccurrence.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        key="download_cooc_xlsx",
-    )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Respondent-level drill-down ──────────────────────────────────────────
-    st.markdown("### 🔎 Respondent-level Drill-down")
-    if resp_df is not None and text_col is not None:
-        all_words = sorted(G.nodes(), key=lambda w: -word_freq.get(w, 0))
-        pick_word = st.selectbox(
-            "Show verbatims containing:",
-            all_words,
-            format_func=display_label,
-            key="drilldown_word",
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            edge_df.to_excel(writer, index=False, sheet_name="co_occurrences")
+            freq_df.to_excel(writer, index=False, sheet_name="word_frequency")
+        st.download_button(
+            "💾 Download co-occurrence data (XLSX)",
+            data=xlsx_buf.getvalue(),
+            file_name="word_cooccurrence.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="download_cooc_xlsx",
         )
-        mask = resp_df["tokens"].apply(lambda toks: pick_word in toks)
-        matches = resp_df.loc[mask]
-        st.write(f"**{len(matches)}** respondent(s) mention *{display_label(pick_word)}*")
-        show_cols = [text_col] + ([group_col] if group_col else [])
-        st.dataframe(matches[show_cols], use_container_width=True, height=300)
-        if len(matches):
-            csv_buf = matches[show_cols].to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "💾 Download matching verbatims (CSV)",
-                data=csv_buf,
-                file_name=f"verbatims_{pick_word}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="download_verbatims_csv",
-            )
+
+    # ── Tab 5: Group Comparison & Diff View (only if a group column is set) ─
+    if group_freqs:
+        with tabs[4]:
+            gnames = list(group_freqs.keys())
+            if len(gnames) < 2:
+                st.info(f"Only one group value found in '{group_col}' — need at least two to compare.")
+            else:
+                gc1, gc2 = st.columns(2)
+                group_a = gc1.selectbox("Group A", gnames, index=0, key="diff_group_a")
+                default_b_idx = 1 if len(gnames) > 1 else 0
+                group_b = gc2.selectbox("Group B", gnames, index=default_b_idx, key="diff_group_b")
+
+                if group_a == group_b:
+                    st.info("Pick two different groups to compare.")
+                else:
+                    freqs_a, freqs_b = group_freqs[group_a], group_freqs[group_b]
+                    total_a = sum(freqs_a.values()) or 1
+                    total_b = sum(freqs_b.values()) or 1
+                    eps = 0.5
+                    diffs = []
+                    for w in set(freqs_a) | set(freqs_b):
+                        a, b = freqs_a.get(w, 0), freqs_b.get(w, 0)
+                        if a + b < 3:
+                            continue
+                        rate_a = (a + eps) / (total_a + eps)
+                        rate_b = (b + eps) / (total_b + eps)
+                        diffs.append((w, math.log2(rate_a / rate_b), a, b))
+                    diffs.sort(key=lambda x: x[1])
+
+                    if not diffs:
+                        st.info("Not enough overlapping vocabulary between these two groups to compare.")
+                    else:
+                        top_b = diffs[:12]
+                        top_a = list(reversed(diffs[-12:]))
+                        plot_rows = top_a + top_b
+                        labels = [display_label(w) for w, _, _, _ in plot_rows]
+                        scores = [s for _, s, _, _ in plot_rows]
+                        bar_colors = ["#0085AF" if s > 0 else "#C62F4B" for s in scores]
+
+                        fig, ax = plt.subplots(figsize=(9, max(3, 0.32 * len(plot_rows))))
+                        y = list(range(len(plot_rows)))
+                        ax.barh(y, scores, color=bar_colors)
+                        ax.set_yticks(y)
+                        ax.set_yticklabels(labels, fontsize=9)
+                        ax.invert_yaxis()
+                        ax.axvline(0, color="#333", linewidth=0.8)
+                        ax.set_xlabel(f"← more typical of {group_b}     |     more typical of {group_a} →")
+                        ax.set_title(f"Word usage skew: {group_a} vs {group_b}")
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+                    wc_a, wc_b = st.columns(2)
+                    wc_a.markdown(f"**Top words — {group_a}** ({group_counts[group_a]} rows)")
+                    wc_a.dataframe(
+                        pd.DataFrame(freqs_a.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
+                        hide_index=True, use_container_width=True,
+                    )
+                    wc_b.markdown(f"**Top words — {group_b}** ({group_counts[group_b]} rows)")
+                    wc_b.dataframe(
+                        pd.DataFrame(freqs_b.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
+                        hide_index=True, use_container_width=True,
+                    )
