@@ -565,8 +565,9 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
 <head>
 <meta charset="utf-8">
 <style>
-  html, body {{ margin:0; padding:0; background:#ffffff; font-family:Arial, sans-serif; overflow:hidden; }}
+  html, body {{ margin:0; padding:0; height:100%; background:#ffffff; font-family:Arial, sans-serif; overflow:hidden; }}
   #wrap {{ position:relative; width:100%; height:100%; }}
+  #viz {{ display:block; width:100%; height:100%; }}
   #toolbar {{
     position:absolute; top:12px; left:50%; transform:translateX(-50%); z-index:9999;
     background:rgba(255,255,255,0.96); padding:8px 16px; border-radius:40px;
@@ -609,7 +610,13 @@ var NODES  = {nodes_json};
 var COLORS = {colors_json};
 var HAS_SENTIMENT = {has_sent_json};
 var COLOR_MODE = "cluster";
-var W = window.innerWidth, H = Math.max(window.innerHeight, 560);
+// Fixed virtual canvas — NOT window.innerWidth/innerHeight. Reading window
+// size at script-execution time is unreliable here: this chart can be the
+// very first thing rendered inside a still-hidden/animating tab panel, in
+// which case the iframe reports 0 width and the whole force layout collapses
+// to nothing. A fixed coordinate space + viewBox scales visually to fill
+// whatever the container turns out to be, independent of that timing.
+var W = 1000, H = 640;
 
 if (HAS_SENTIMENT) {{
   document.getElementById("sentToggleWrap").innerHTML =
@@ -632,8 +639,9 @@ function setColorMode(mode) {{
   }});
 }}
 
-var svg = d3.select("#viz").attr("width", W).attr("height", H)
-            .attr("viewBox", [0, 0, W, H]);
+var svg = d3.select("#viz")
+            .attr("viewBox", [0, 0, W, H])
+            .attr("preserveAspectRatio", "xMidYMid meet");
 var g = svg.append("g");
 var tooltip = d3.select("#tooltip");
 
@@ -812,13 +820,25 @@ function exportPNG() {{
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
+if "hide_frag_warning" not in st.session_state:
+    st.session_state["hide_frag_warning"] = False
+
 with st.sidebar:
-    st.warning(
-        "⚠️ This verbatim analysis suite is designed for **non-fragrance-related** text, "
-        "or **huge batches of aggregated verbatims** (e.g. thousands). For fragrance / "
-        "fragrance test analysis, please use **Text-Mining** or **Verbatim Studio** instead.",
-        icon="⚠️",
-    )
+    if not st.session_state["hide_frag_warning"]:
+        warn_col, close_col = st.columns([10, 1])
+        warn_col.markdown(
+            """<div style="background:#fff3cd;color:#664d03;border:1px solid #ffe69c;
+            border-radius:8px;padding:7px 10px;font-size:11.5px;line-height:1.4;">
+            ⚠️ This verbatim analysis suite is designed for <b>non-fragrance-related</b> text,
+            or <b>huge batches of aggregated verbatims</b> (e.g. thousands). For fragrance /
+            fragrance test analysis, please use <b>Text-Mining</b> or <b>Verbatim Studio</b> instead.
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        if close_col.button("✕", key="dismiss_frag_warning", help="Dismiss this notice"):
+            st.session_state["hide_frag_warning"] = True
+            st.rerun()
+
     st.title("⚙️ Settings")
     uploaded_file = st.file_uploader("📂 Upload Excel corpus", type=["xlsx"])
     st.markdown("---")
