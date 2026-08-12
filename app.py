@@ -255,73 +255,178 @@ function exportPNG() {{
     return html.replace("</body>", inject + "\n</body>")
 
 
-# ─── Word tree / relationship-tree builder ───────────────────────────────────
-def build_tree_html(G, word_freq, node_subset, title, filename="word_tree"):
-    """Hierarchical (root-out) view of how a set of words relate, built as a
-    maximum-spanning-tree of the co-occurrence graph restricted to node_subset."""
-    sub = G.subgraph(node_subset).copy()
-    if sub.number_of_nodes() < 2 or sub.number_of_edges() == 0:
-        return None
+# ─── Cluster bubbles (circle-packing) builder ────────────────────────────────
+def build_bubbles_html(word_freq, full_partition, cluster_ids, scope, filename="cluster_bubbles"):
+    """Zoomable circle-packing chart: root → cluster → word, sized by frequency,
+    colored by cluster. Reflects the real cluster assignment directly (unlike a
+    spanning-tree cut of the co-occurrence graph, which needs a connected
+    subgraph and an arbitrary root)."""
+    color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(cluster_ids)}
 
-    # Reduce to a tree so a hierarchical layout has something sensible to draw
-    tree = nx.maximum_spanning_tree(sub, weight="weight")
-    root = max(tree.nodes(), key=lambda n: word_freq.get(n, 0))
+    if scope == "Entire sample":
+        children = []
+        for i, cid in enumerate(cluster_ids):
+            members = [w for w, c in full_partition.items() if c == cid]
+            if not members:
+                continue
+            children.append({
+                "name": f"Cluster {i+1}",
+                "cluster": cid,
+                "children": [
+                    {"name": w, "value": max(1, int(word_freq.get(w, 1))), "cluster": cid}
+                    for w in members
+                ],
+            })
+        data = {"name": "root", "children": children}
+    else:
+        idx = int(scope.split(" ")[1]) - 1
+        cid = cluster_ids[idx]
+        members = [w for w, c in full_partition.items() if c == cid]
+        if not members:
+            return None
+        data = {
+            "name": scope,
+            "cluster": cid,
+            "children": [
+                {"name": w, "value": max(1, int(word_freq.get(w, 1))), "cluster": cid}
+                for w in members
+            ],
+        }
 
-    net = Network(height="550px", width="100%", bgcolor="#ffffff", font_color="#333333", directed=False)
-    net.set_options("""{
-      "layout": {"hierarchical": {"enabled": true, "direction": "UD",
-                  "sortMethod": "hubsize", "nodeSpacing": 140, "levelSeparation": 110}},
-      "physics": {"enabled": false},
-      "interaction": {"hover": true}
-    }""")
+    data_json  = json.dumps(data)
+    colors_json = json.dumps(color_map)
 
-    for node in tree.nodes():
-        freq = word_freq.get(node, 1)
-        is_root = node == root
-        net.add_node(
-            node,
-            label=node,
-            title=f"<b>{node}</b><br>Occurrences: {freq}",
-            color={
-                "background": "#0085AF" if is_root else "#6AAB6A",
-                "border": "#013848" if is_root else "#2A6A2A",
-            },
-            size=max(12, min(36, 12 + freq)),
-            shape="box",
-            font={"size": 13, "color": "#ffffff", "face": "Arial"},
-            borderWidth=2,
-        )
-    for u, v, data in tree.edges(data=True):
-        net.add_edge(u, v, value=data.get("weight", 1), color="#c8d8e8")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp:
-        net.save_graph(tmp.name)
-        with open(tmp.name, "r", encoding="utf-8") as f:
-            html = f.read()
-
-    inject = f"""
-<div style="position:absolute; top:10px; right:14px; z-index:9999;">
-  <div onclick="exportTreePNG()"
-    style="background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
-    cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;user-select:none;">📷 PNG</div>
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ margin:0; padding:0; background:#ffffff; font-family:Arial, sans-serif; overflow:hidden; }}
+  #wrap {{ position:relative; width:100%; height:100%; }}
+  #toolbar {{
+    position:absolute; top:12px; left:50%; transform:translateX(-50%); z-index:9999;
+    background:rgba(255,255,255,0.96); padding:8px 16px; border-radius:40px;
+    box-shadow:0 2px 14px rgba(0,0,0,0.13); border:1px solid #e8e8e8;
+    display:flex; align-items:center; gap:8px; font-size:12px;
+  }}
+  #toolbar div.btn {{
+    background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
+    cursor:pointer;font-weight:bold;white-space:nowrap;user-select:none;
+  }}
+  #toolbar div.btn.reset {{ background:#f0f0f0;color:#555;border:1px solid #ddd; }}
+  .bubble-label {{ pointer-events:none; font-weight:600; fill:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.35); }}
+  .group-label {{ pointer-events:none; font-weight:700; fill:#333; }}
+  circle {{ cursor:pointer; }}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="toolbar">
+    <div class="btn reset" onclick="resetZoom()">↺ Reset view</div>
+    <div class="btn" onclick="exportPNG()">📷 PNG</div>
+  </div>
+  <svg id="viz"></svg>
 </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
-function exportTreePNG() {{
-  try {{
-    var canvas = network.canvas.frame.canvas;
+var DATA   = {data_json};
+var COLORS = {colors_json};
+var W = window.innerWidth, H = Math.max(window.innerHeight, 550);
+
+var svg = d3.select("#viz").attr("width", W).attr("height", H)
+            .attr("viewBox", [0, 0, W, H]);
+var g = svg.append("g");
+
+var zoomBeh = d3.zoom().scaleExtent([0.3, 8]).on("zoom", function(ev) {{
+  g.attr("transform", ev.transform);
+}});
+svg.call(zoomBeh);
+
+function resetZoom() {{
+  svg.transition().duration(400).call(zoomBeh.transform, d3.zoomIdentity);
+}}
+
+var root = d3.hierarchy(DATA)
+  .sum(function(d) {{ return d.value || 0; }})
+  .sort(function(a, b) {{ return b.value - a.value; }});
+
+var pack = d3.pack().size([W - 40, H - 60]).padding(function(d) {{ return d.depth === 1 ? 18 : 3; }});
+pack(root);
+
+g.attr("transform", "translate(20,50)");
+
+var node = g.selectAll("g.node")
+  .data(root.descendants().slice(1))
+  .join("g")
+  .attr("class", "node")
+  .attr("transform", function(d) {{ return "translate(" + d.x + "," + d.y + ")"; }});
+
+node.append("circle")
+  .attr("r", function(d) {{ return d.r; }})
+  .attr("fill", function(d) {{
+    var c = COLORS[d.data.cluster] || "#999999";
+    return d.children ? c + "22" : c;
+  }})
+  .attr("stroke", function(d) {{ return d.children ? (COLORS[d.data.cluster] || "#999999") : "rgba(0,0,0,0.15)"; }})
+  .attr("stroke-width", function(d) {{ return d.children ? 2 : 1; }})
+  .append("title")
+  .text(function(d) {{ return d.data.name + (d.children ? "" : " — " + d.data.value + " occurrences"); }});
+
+// Group (cluster) labels, placed above each cluster's bubble cluster
+node.filter(function(d) {{ return d.depth === 1 && d.children; }})
+  .append("text")
+  .attr("class", "group-label")
+  .attr("text-anchor", "middle")
+  .attr("y", function(d) {{ return -d.r - 8; }})
+  .style("font-size", function(d) {{ return Math.max(12, Math.min(16, d.r / 6)) + "px"; }})
+  .text(function(d) {{ return d.data.name; }});
+
+// Word labels, only where the bubble is big enough to hold text
+node.filter(function(d) {{ return !d.children && d.r > 14; }})
+  .append("text")
+  .attr("class", "bubble-label")
+  .attr("text-anchor", "middle")
+  .attr("dy", "0.32em")
+  .style("font-size", function(d) {{ return Math.max(9, Math.min(15, d.r / 2.6)) + "px"; }})
+  .text(function(d) {{
+    var maxChars = Math.max(3, Math.floor(d.r / 4));
+    return d.data.name.length > maxChars ? d.data.name.slice(0, maxChars - 1) + "…" : d.data.name;
+  }});
+
+function exportPNG() {{
+  var svgEl = document.getElementById("viz");
+  var serializer = new XMLSerializer();
+  var source = serializer.serializeToString(svgEl);
+  if (!source.match(/^<svg[^>]+xmlns="http:\\/\\/www\\.w3\\.org\\/2000\\/svg"/)) {{
+    source = source.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
+  }}
+  var svgBlob = new Blob([source], {{type: "image/svg+xml;charset=utf-8"}});
+  var url = URL.createObjectURL(svgBlob);
+  var img = new Image();
+  img.onload = function() {{
+    var scale = 2;
+    var canvas = document.createElement("canvas");
+    canvas.width = W * scale;
+    canvas.height = H * scale;
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0, W, H);
+    URL.revokeObjectURL(url);
     var link = document.createElement("a");
     link.download = "{filename}.png";
     link.href = canvas.toDataURL("image/png");
-    document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-  }} catch (e) {{
-    alert("PNG export failed: " + e.message);
-  }}
+  }};
+  img.src = url;
 }}
 </script>
+</body>
+</html>
 """
-    return html.replace("</body>", inject + "\n</body>")
+    return html
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
@@ -389,104 +494,132 @@ if uploaded_file:
                 G.nodes[node]["x"] = float(x) * 1000
                 G.nodes[node]["y"] = float(y) * 1000
 
-            # ── Cluster summary cards ───────────────────────────────────────
             cluster_ids = sorted(set(best_p.values()))
-            st.markdown("### Cluster overview")
-            card_cols = st.columns(len(cluster_ids))
-            for i, cid in enumerate(cluster_ids):
-                members = sorted(
-                    [w for w, c in best_p.items() if c == cid],
-                    key=lambda w: -word_freq[w],
-                )
-                col_bg = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
-                card_cols[i].markdown(
-                    f"""<div style="background:{col_bg};color:#fff;padding:12px 10px;
-                        border-radius:10px;border-left:5px solid rgba(0,0,0,0.2);">
-                        <div style="font-size:.75em;opacity:.8;letter-spacing:.06em;">CLUSTER {i+1}</div>
-                        <div style="font-weight:bold;font-size:1.05em;margin:4px 0;">
-                          {members[0].upper() if members else "—"}
-                        </div>
-                        <div style="font-size:.72em;line-height:1.4;opacity:.9;">
-                          {", ".join(members[1:5])}{"…" if len(members) > 5 else ""}
-                        </div>
-                        <div style="font-size:.7em;margin-top:6px;opacity:.75;">
-                          {len(members)} words
-                        </div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
 
-            st.markdown("<br>", unsafe_allow_html=True)
+            # ── Everything downstream (map html, word cloud, bubbles) only
+            #    needs word_freq / G / best_p / cluster_ids — precompute the
+            #    one expensive artifact (the map) now and stash it all in
+            #    session_state. Rendering below then runs on EVERY rerun
+            #    (including ones triggered by a selectbox change), not just
+            #    the run where the button was clicked. ──────────────────────
+            st.session_state["results"] = {
+                "word_freq": word_freq,
+                "G": G,
+                "best_p": best_p,
+                "cluster_ids": cluster_ids,
+                "html_map": build_html(G, best_p, word_freq, filename="semantic_map"),
+            }
 
-            # ── Build & render map ──────────────────────────────────────────
-            html_map = build_html(G, best_p, word_freq, filename="semantic_map")
+# ── Render from session_state — survives selectbox/slider reruns ────────────
+if "results" in st.session_state:
+    res = st.session_state["results"]
+    word_freq   = res["word_freq"]
+    G           = res["G"]
+    best_p      = res["best_p"]
+    cluster_ids = res["cluster_ids"]
+    html_map    = res["html_map"]
 
-            # Download button in sidebar
-            st.sidebar.markdown("---")
-            st.sidebar.download_button(
-                "💾 Download HTML map",
-                data=html_map,
-                file_name="semantic_map.html",
-                mime="text/html",
-                use_container_width=True,
-            )
+    # ── Cluster summary cards ───────────────────────────────────────────────
+    st.markdown("### Cluster overview")
+    card_cols = st.columns(len(cluster_ids))
+    for i, cid in enumerate(cluster_ids):
+        members = sorted(
+            [w for w, c in best_p.items() if c == cid],
+            key=lambda w: -word_freq[w],
+        )
+        col_bg = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+        card_cols[i].markdown(
+            f"""<div style="background:{col_bg};color:#fff;padding:12px 10px;
+                border-radius:10px;border-left:5px solid rgba(0,0,0,0.2);">
+                <div style="font-size:.75em;opacity:.8;letter-spacing:.06em;">CLUSTER {i+1}</div>
+                <div style="font-weight:bold;font-size:1.05em;margin:4px 0;">
+                  {members[0].upper() if members else "—"}
+                </div>
+                <div style="font-size:.72em;line-height:1.4;opacity:.9;">
+                  {", ".join(members[1:5])}{"…" if len(members) > 5 else ""}
+                </div>
+                <div style="font-size:.7em;margin-top:6px;opacity:.75;">
+                  {len(members)} words
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
 
-            st.components.v1.html(html_map, height=750, scrolling=False)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-            # ── Word cloud ───────────────────────────────────────────────────
-            st.markdown("### ☁️ Word Cloud")
-            cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-            cloud_scope = st.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
+    # Download button in sidebar — now stable across reruns since html_map
+    # comes from session_state rather than only existing mid-button-click.
+    st.sidebar.markdown("---")
+    st.sidebar.download_button(
+        "💾 Download HTML map",
+        data=html_map,
+        file_name="semantic_map.html",
+        mime="text/html",
+        use_container_width=True,
+        key="download_map_html",
+    )
 
-            if cloud_scope == "Entire sample":
-                cloud_freqs = dict(word_freq)
-            else:
-                idx = int(cloud_scope.split(" ")[1]) - 1
-                cid = cluster_ids[idx]
-                cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == cid}
+    st.components.v1.html(html_map, height=750, scrolling=False)
 
-            if cloud_freqs:
-                wc = WordCloud(
-                    width=1100, height=550, background_color="white",
-                    colormap="viridis", prefer_horizontal=0.9,
-                ).generate_from_frequencies(cloud_freqs)
+    # ── Word cloud ───────────────────────────────────────────────────────────
+    st.markdown("### ☁️ Word Cloud")
+    cloud_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+    cloud_scope = st.selectbox("Show word cloud for:", cloud_options, key="cloud_scope")
 
-                fig, ax = plt.subplots(figsize=(11, 5.5))
-                ax.imshow(wc, interpolation="bilinear")
-                ax.axis("off")
-                st.pyplot(fig)
-                plt.close(fig)
+    if cloud_scope == "Entire sample":
+        cloud_freqs = dict(word_freq)
+    else:
+        idx = int(cloud_scope.split(" ")[1]) - 1
+        cid = cluster_ids[idx]
+        cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == cid}
 
-                buf = io.BytesIO()
-                wc.to_image().save(buf, format="PNG")
-                st.download_button(
-                    "💾 Download word cloud (PNG)",
-                    data=buf.getvalue(),
-                    file_name=f"wordcloud_{cloud_scope.replace(' ', '_').lower()}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
-            else:
-                st.info("No words to display for this selection.")
+    if cloud_freqs:
+        wc = WordCloud(
+            width=1100, height=550, background_color="white",
+            colormap="viridis", prefer_horizontal=0.9,
+        ).generate_from_frequencies(cloud_freqs)
 
-            st.markdown("<br>", unsafe_allow_html=True)
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        st.pyplot(fig)
+        plt.close(fig)
 
-            # ── Word tree / relationship tree ─────────────────────────────────
-            st.markdown("### 🌳 Word Tree")
-            tree_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
-            tree_scope = st.selectbox("Show word tree for:", tree_options, key="tree_scope")
+        buf = io.BytesIO()
+        wc.to_image().save(buf, format="PNG")
+        st.download_button(
+            "💾 Download word cloud (PNG)",
+            data=buf.getvalue(),
+            file_name=f"wordcloud_{cloud_scope.replace(' ', '_').lower()}.png",
+            mime="image/png",
+            use_container_width=True,
+            key="download_wordcloud_png",
+        )
+    else:
+        st.info("No words to display for this selection.")
 
-            if tree_scope == "Entire sample":
-                tree_nodes = list(G.nodes())
-                tree_fname = "word_tree_all"
-            else:
-                idx = int(tree_scope.split(" ")[1]) - 1
-                cid = cluster_ids[idx]
-                tree_nodes = [w for w, c in best_p.items() if c == cid]
-                tree_fname = f"word_tree_cluster_{idx+1}"
+    st.markdown("<br>", unsafe_allow_html=True)
 
-            tree_html = build_tree_html(G, word_freq, tree_nodes, tree_scope, filename=tree_fname)
-            if tree_html:
-                st.components.v1.html(tree_html, height=600, scrolling=False)
-            else:
-                st.info("Not enough connected words in this selection to build a tree.")
+    # ── Cluster bubbles (circle-packing, replaces the old word tree) ─────────
+    st.markdown("### 🔵 Cluster Bubbles")
+    st.caption("Word size = frequency · color = cluster · scroll to zoom, drag to pan")
+    bubble_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+    bubble_scope = st.selectbox("Show bubbles for:", bubble_options, key="bubble_scope")
+
+    bubble_fname = (
+        "cluster_bubbles_all" if bubble_scope == "Entire sample"
+        else f"cluster_bubbles_{bubble_scope.replace(' ', '_').lower()}"
+    )
+    bubble_html = build_bubbles_html(word_freq, best_p, cluster_ids, bubble_scope, filename=bubble_fname)
+    if bubble_html:
+        st.components.v1.html(bubble_html, height=650, scrolling=False)
+        st.download_button(
+            "💾 Download cluster bubbles (HTML)",
+            data=bubble_html,
+            file_name=f"{bubble_fname}.html",
+            mime="text/html",
+            use_container_width=True,
+            key="download_bubbles_html",
+        )
+    else:
+        st.info("No words to display for this selection.")
