@@ -1,7 +1,9 @@
-streamlit
-pandas
-openpyxl
-nltk
-networkx
-pyvis
-python-louvain
+streamlit>=1.30
+pandas>=2.0
+openpyxl>=3.1
+nltk>=3.8
+networkx>=3.0
+pyvis>=0.3.2
+python-louvain>=0.16
+wordcloud>=1.9
+matplotlib>=3.7
