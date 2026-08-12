@@ -3,6 +3,10 @@ import pandas as pd
 import nltk
 from nltk.stem import WordNetLemmatizer
 from nltk.corpus import stopwords
+from nltk.sentiment import SentimentIntensityAnalyzer
+from nltk.collocations import BigramCollocationFinder
+from nltk.metrics import BigramAssocMeasures
+from sklearn.feature_extraction.text import TfidfVectorizer
 import networkx as nx
 from pyvis.network import Network
 from collections import Counter
@@ -11,6 +15,7 @@ import re
 import os
 import json
 import io
+import math
 import tempfile
 import community as community_louvain  # python-louvain
 from wordcloud import WordCloud
@@ -23,6 +28,7 @@ st.set_page_config(page_title="English Semantic Explorer", layout="wide")
 nltk.download("wordnet", quiet=True)
 nltk.download("stopwords", quiet=True)
 nltk.download("omw-1.4",  quiet=True)
+nltk.download("vader_lexicon", quiet=True)
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 DEFAULT_EXCLUSIONS = [
@@ -80,6 +86,30 @@ def rgb_str(hex_color):
     r, g, b = hex_to_rgb(hex_color)
     return f"rgb({r},{g},{b})"
 
+def sentiment_to_color(score):
+    """score in [-1,1] (VADER compound) → diverging red↔grey↔green hex."""
+    score = max(-1.0, min(1.0, score if score is not None else 0.0))
+    NEG, NEU, POS = (198, 47, 75), (222, 222, 222), (76, 175, 80)
+    base = NEG if score < 0 else POS
+    t = abs(score)
+    r = base[0] * t + NEU[0] * (1 - t)
+    g = base[1] * t + NEU[1] * (1 - t)
+    b = base[2] * t + NEU[2] * (1 - t)
+    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+
+def normalize_sizes(values_dict, out_min=12, out_max=42):
+    """Rescale an arbitrary metric (raw counts OR TF-IDF scores, whatever
+    magnitude) onto a fixed pixel-size range, so node/bubble sizing looks
+    sane regardless of which weighting metric is active."""
+    if not values_dict:
+        return {}
+    vals = list(values_dict.values())
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        mid = (out_min + out_max) / 2
+        return {k: mid for k in values_dict}
+    return {k: out_min + (v - lo) / (hi - lo) * (out_max - out_min) for k, v in values_dict.items()}
+
 # Readable, dataviz-friendly fonts for the word cloud. Values are relative
 # paths this app expects to find under a local "fonts/" folder — TTF files
 # aren't bundled here (no network access to fetch them), so add the actual
@@ -100,6 +130,13 @@ FONT_OPTIONS = {
 def load_lemmatizer():
     return WordNetLemmatizer()
 
+@st.cache_resource
+def load_sentiment_analyzer():
+    try:
+        return SentimentIntensityAnalyzer()
+    except Exception:
+        return None
+
 def preprocess(text, lemmatizer, custom_stops):
     if not isinstance(text, str) or not text.strip():
         return []
@@ -118,9 +155,94 @@ def preprocess(text, lemmatizer, custom_stops):
         if lemma not in STOP_WORDS and lemma not in custom_stops and len(lemma) > 2
     ]
 
+def display_label(word):
+    """Phrase tokens are stored internally as 'easy_apply' (a valid, unique
+    graph/dict key); shown to the user as 'easy apply'."""
+    return word.replace("_", " ")
+
+# ─── Phrase (n-gram) detection ────────────────────────────────────────────────
+def extract_top_bigrams(token_lists, min_freq=4, top_n=30):
+    """Find recurring, meaningfully-associated adjacent word pairs (PMI-scored,
+    within-row only — no bigrams manufactured across row boundaries)."""
+    docs = [toks for toks in token_lists if len(toks) > 1]
+    if not docs:
+        return set()
+    finder = BigramCollocationFinder.from_documents(docs)
+    finder.apply_freq_filter(min_freq)
+    if not finder.ngram_fd:
+        return set()
+    scored = finder.score_ngrams(BigramAssocMeasures.pmi)
+    return set(bg for bg, _ in scored[:top_n])
+
+def merge_bigrams(tokens, bigram_set):
+    """Greedy, non-overlapping, left-to-right merge of adjacent tokens that
+    form one of the detected phrases into a single 'word_word' token."""
+    if not bigram_set:
+        return tokens
+    merged, i, n = [], 0, len(tokens)
+    while i < n:
+        if i < n - 1 and (tokens[i], tokens[i + 1]) in bigram_set:
+            merged.append(tokens[i] + "_" + tokens[i + 1])
+            i += 2
+        else:
+            merged.append(tokens[i])
+            i += 1
+    return merged
+
+# ─── Sentiment ────────────────────────────────────────────────────────────────
+def compute_row_sentiment(texts, analyzer):
+    if analyzer is None:
+        return [None] * len(texts)
+    scores = []
+    for t in texts:
+        if isinstance(t, str) and t.strip():
+            try:
+                scores.append(analyzer.polarity_scores(t)["compound"])
+            except Exception:
+                scores.append(None)
+        else:
+            scores.append(None)
+    return scores
+
+def compute_word_sentiment(token_lists, row_sentiments):
+    sums, counts = Counter(), Counter()
+    for tokens, sent in zip(token_lists, row_sentiments):
+        if sent is None:
+            continue
+        for w in set(tokens):
+            sums[w] += sent
+            counts[w] += 1
+    return {w: sums[w] / counts[w] for w in sums}
+
+def cluster_avg_sentiment(members, word_freq, word_sent):
+    num = sum(word_sent.get(w, 0.0) * word_freq.get(w, 0) for w in members if w in word_sent)
+    den = sum(word_freq.get(w, 0) for w in members if w in word_sent)
+    return (num / den) if den else None
+
+# ─── TF-IDF weighting ──────────────────────────────────────────────────────────
+def compute_tfidf_scores(token_lists):
+    docs = [" ".join(toks) for toks in token_lists if toks]
+    if not docs:
+        return {}
+    vectorizer = TfidfVectorizer(
+        tokenizer=lambda x: x.split(), preprocessor=lambda x: x,
+        token_pattern=None, lowercase=False,
+    )
+    matrix = vectorizer.fit_transform(docs)
+    sums = matrix.sum(axis=0).A1
+    vocab = vectorizer.get_feature_names_out()
+    return dict(zip(vocab, sums))
+
 # ─── Network builder ─────────────────────────────────────────────────────────
-def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
+def build_html(G, partition, word_freq, color_map, size_map=None, word_sent=None, filename="semantic_map"):
     cluster_ids = sorted(set(partition.values()))
+    size_map = size_map or word_freq
+    word_sent = word_sent or {}
+    has_sentiment = bool(word_sent)
+
+    pixel_sizes = normalize_sizes(
+        {n: size_map.get(n, word_freq.get(n, 1)) for n in G.nodes()}, 12, 42
+    )
 
     net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="#333333")
 
@@ -131,6 +253,7 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
     # fade/highlight is what caused clusters after the first to render wrong
     # and "All" to come back grey.
     node_meta = {}
+    node_sent = {}
 
     for node in G.nodes():
         cluster = partition[node]
@@ -146,12 +269,29 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
                 "strokeWidth": 2, "strokeColor": "rgba(0,0,0,0.3)"}
         node_meta[node] = {"color": color, "font": font, "group": str(cluster)}
 
+        if has_sentiment:
+            sc = sentiment_to_color(word_sent.get(node, 0.0))
+            node_sent[node] = {
+                "color": {
+                    "background": sc,
+                    "border": darken_hex(sc),
+                    "highlight": {"background": "#FF8000", "border": "#CC5500"},
+                },
+                "font": {"size": 13, "color": "#222222", "face": "Arial",
+                         "strokeWidth": 2, "strokeColor": "rgba(255,255,255,0.6)"},
+                "group": str(cluster),
+            }
+
+        title = f"<b>{display_label(node)}</b><br>Occurrences: {freq}<br>Cluster: {cluster + 1}"
+        if has_sentiment and node in word_sent:
+            title += f"<br>Sentiment: {word_sent[node]:+.2f}"
+
         net.add_node(
             node,
-            label=node,
-            title=f"<b>{node}</b><br>Occurrences: {freq}<br>Cluster: {cluster + 1}",
+            label=display_label(node),
+            title=title,
             color=color,
-            size=max(10, min(40, 10 + freq * 1.2)),
+            size=pixel_sizes.get(node, 20),
             shape="box",
             group=str(cluster),
             x=x, y=y,
@@ -188,16 +328,30 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
             [w for w, cl in partition.items() if cl == c],
             key=lambda w: -word_freq.get(w, 0),
         )
-        top = members[0].upper() if members else f"C{i+1}"
+        top = display_label(members[0]).upper() if members else f"C{i+1}"
         col = color_map[c]
+        tooltip_words = ", ".join(display_label(w) for w in members[:6])
         legend_pills += (
             f'<div onclick="filterCluster({c})" '
             f'style="background:{col};color:#fff;padding:6px 14px;border-radius:20px;'
             f'cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;'
             f'box-shadow:0 1px 4px rgba(0,0,0,0.18);user-select:none;" '
-            f'title="{", ".join(members[:6])}">'
+            f'title="{tooltip_words}">'
             f'● C{i+1} – {top}'
             f'</div>\n'
+        )
+
+    sent_toggle_html = ""
+    if has_sentiment:
+        sent_toggle_html = (
+            '<span style="width:1px;height:20px;background:#ddd;margin:0 2px;"></span>'
+            '<div onclick="setColorMode(\'cluster\')" id="modeClusterBtn" '
+            'style="background:#2b2b2b;color:#fff;padding:6px 12px;border-radius:20px;'
+            'cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;user-select:none;">🎨 Cluster</div>'
+            '<div onclick="setColorMode(\'sentiment\')" id="modeSentBtn" '
+            'style="background:#f0f0f0;color:#555;padding:6px 12px;border-radius:20px;'
+            'cursor:pointer;font-size:12px;font-weight:bold;border:1px solid #ddd;'
+            'white-space:nowrap;user-select:none;">😊 Sentiment</div>'
         )
 
     # ── JS: NODE_META is authored once in Python and never mutated in JS.
@@ -206,6 +360,7 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
     #        switching clusters repeatedly, or hitting "All" after several
     #        switches, always reproduces the correct original colors.  ───────
     node_meta_json = json.dumps(node_meta)
+    node_sent_json = json.dumps(node_sent)
 
     inject = f"""
 <!-- ═══ CLUSTER TOOLBAR ═══ -->
@@ -228,6 +383,7 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
     style="background:#2b2b2b;color:#fff;padding:6px 14px;border-radius:20px;
     cursor:pointer;font-size:12px;font-weight:bold;
     white-space:nowrap;user-select:none;margin-left:6px;">📷 PNG</div>
+  {sent_toggle_html}
   <span style="width:1px;height:20px;background:#ddd;margin:0 2px;"></span>
   <input id="searchBox" type="text" placeholder="Search a word…"
     onkeydown="if(event.key==='Enter'){{searchWord();}}"
@@ -243,6 +399,24 @@ def build_html(G, partition, word_freq, color_map, filename="semantic_map"):
 //    live/rendered network, so it can never pick up a faded/highlighted
 //    state by accident. ───────────────────────────────────────────────────
 var NODE_META = {node_meta_json};   // {{ nodeId: {{ color, font, group }} }}
+var NODE_SENT = {node_sent_json};   // same shape, sentiment-based colors (may be empty)
+var ACTIVE_META = NODE_META;
+
+function setColorMode(mode) {{
+  ACTIVE_META = (mode === "sentiment" && Object.keys(NODE_SENT).length) ? NODE_SENT : NODE_META;
+  var cBtn = document.getElementById("modeClusterBtn");
+  var sBtn = document.getElementById("modeSentBtn");
+  if (cBtn && sBtn) {{
+    if (mode === "sentiment") {{
+      sBtn.style.background = "#2b2b2b"; sBtn.style.color = "#fff"; sBtn.style.border = "none";
+      cBtn.style.background = "#f0f0f0"; cBtn.style.color = "#555"; cBtn.style.border = "1px solid #ddd";
+    }} else {{
+      cBtn.style.background = "#2b2b2b"; cBtn.style.color = "#fff"; cBtn.style.border = "none";
+      sBtn.style.background = "#f0f0f0"; sBtn.style.color = "#555"; sBtn.style.border = "1px solid #ddd";
+    }}
+  }}
+  showAll();
+}}
 
 var FADE_NODE = {{ background:"rgba(220,220,220,0.25)", border:"rgba(200,200,200,0.2)",
                    highlight:{{ background:"rgba(220,220,220,0.25)", border:"rgba(200,200,200,0.2)" }} }};
@@ -253,7 +427,7 @@ var FULL_EDGE = "#c8d8e8";
 function showAll() {{
   network.body.data.nodes.update(
     Object.keys(NODE_META).map(function(id) {{
-      var m = NODE_META[id];
+      var m = ACTIVE_META[id];
       return {{ id:id, color:m.color, font:m.font, borderWidth:2 }};
     }})
   );
@@ -274,10 +448,11 @@ function filterCluster(cid) {{
   }});
 
   // Every node gets an explicit, fully-specified color/font on every call —
-  // selected nodes from NODE_META (true originals), everything else faded.
+  // selected nodes from the active metadata set (true originals), everything
+  // else faded.
   network.body.data.nodes.update(
     Object.keys(NODE_META).map(function(id) {{
-      var m = NODE_META[id];
+      var m = ACTIVE_META[id];
       if (inCluster[id]) {{
         return {{ id:id, color:m.color, font:m.font }};
       }} else {{
@@ -294,6 +469,8 @@ function filterCluster(cid) {{
   );
 }}
 
+function normWord(s) {{ return s.replace(/_/g, " ").toLowerCase(); }}
+
 function searchWord() {{
   var msg = document.getElementById("searchMsg");
   var q = document.getElementById("searchBox").value.trim().toLowerCase();
@@ -301,9 +478,9 @@ function searchWord() {{
   if (!q) return;
 
   var ids = Object.keys(NODE_META);
-  var match = ids.find(function(id) {{ return id.toLowerCase() === q; }});
+  var match = ids.find(function(id) {{ return normWord(id) === q; }});
   if (!match) {{
-    match = ids.find(function(id) {{ return id.toLowerCase().indexOf(q) !== -1; }});
+    match = ids.find(function(id) {{ return normWord(id).indexOf(q) !== -1; }});
   }}
 
   if (!match) {{
@@ -343,12 +520,15 @@ function exportPNG() {{
 
 
 # ─── Cluster bubbles (circle-packing) builder ────────────────────────────────
-def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope, filename="cluster_bubbles"):
+def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
+                        size_map=None, word_sent=None, filename="cluster_bubbles"):
     """Force-directed, draggable bubble chart: each word is its own bubble,
-    sized by frequency and colored by cluster, gently pulled toward its
-    cluster's 'gravity well' but free to be dragged around. Replaces the old
-    static circle-packing layout, which couldn't be interacted with and
-    under-sized most word labels to invisibility."""
+    sized by frequency (or TF-IDF, if that weighting is active) and colored by
+    cluster (or sentiment, toggle permitting), gently pulled toward its
+    cluster's 'gravity well' but free to be dragged around."""
+    size_map = size_map or word_freq
+    word_sent = word_sent or {}
+    has_sentiment = bool(word_sent)
 
     if scope == "Entire sample":
         scopes = list(enumerate(cluster_ids))
@@ -360,12 +540,16 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
     for i, cid in scopes:
         members = [w for w, c in full_partition.items() if c == cid]
         for w in members:
+            sent = word_sent.get(w)
             nodes.append({
                 "id": w,
-                "name": w,
-                "value": max(1, int(word_freq.get(w, 1))),
+                "name": display_label(w),
+                "value": float(size_map.get(w, word_freq.get(w, 1))),
+                "freq": int(word_freq.get(w, 1)),
                 "cluster": cid,
                 "clusterLabel": f"Cluster {i+1}",
+                "sentColor": sentiment_to_color(sent) if sent is not None else "#999999",
+                "sentiment": sent,
             })
 
     if not nodes:
@@ -373,6 +557,7 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
 
     nodes_json  = json.dumps(nodes)
     colors_json = json.dumps(color_map)
+    has_sent_json = json.dumps(has_sentiment)
 
     html = f"""
 <!DOCTYPE html>
@@ -393,6 +578,7 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
     cursor:pointer;font-weight:bold;white-space:nowrap;user-select:none;
   }}
   #toolbar div.btn.reset {{ background:#f0f0f0;color:#555;border:1px solid #ddd; }}
+  #toolbar div.btn.inactive {{ background:#f0f0f0;color:#555;border:1px solid #ddd; }}
   .bubble-label {{ pointer-events:none; font-weight:600; fill:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.4); }}
   .group-label {{ pointer-events:none; font-weight:700; fill:#555; letter-spacing:.04em; }}
   circle.word {{ cursor:grab; }}
@@ -412,6 +598,7 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
   <div id="toolbar">
     <div class="btn reset" onclick="resetView()">↺ Reset</div>
     <div class="btn" onclick="exportPNG()">📷 PNG</div>
+    <span id="sentToggleWrap"></span>
   </div>
   <div id="tooltip"></div>
   <svg id="viz"></svg>
@@ -420,7 +607,30 @@ def build_bubbles_html(word_freq, full_partition, cluster_ids, color_map, scope,
 <script>
 var NODES  = {nodes_json};
 var COLORS = {colors_json};
+var HAS_SENTIMENT = {has_sent_json};
+var COLOR_MODE = "cluster";
 var W = window.innerWidth, H = Math.max(window.innerHeight, 560);
+
+if (HAS_SENTIMENT) {{
+  document.getElementById("sentToggleWrap").innerHTML =
+    '<span style="width:1px;height:20px;background:#ddd;margin:0 2px;display:inline-block;"></span>' +
+    '<div class="btn" id="modeClusterBtn" onclick="setColorMode(\\'cluster\\')">🎨 Cluster</div>' +
+    '<div class="btn inactive" id="modeSentBtn" onclick="setColorMode(\\'sentiment\\')">😊 Sentiment</div>';
+}}
+
+function setColorMode(mode) {{
+  COLOR_MODE = mode;
+  var cBtn = document.getElementById("modeClusterBtn");
+  var sBtn = document.getElementById("modeSentBtn");
+  if (mode === "sentiment") {{
+    sBtn.className = "btn"; cBtn.className = "btn inactive";
+  }} else {{
+    cBtn.className = "btn"; sBtn.className = "btn inactive";
+  }}
+  g.selectAll("circle.word").attr("fill", function(d) {{
+    return COLOR_MODE === "sentiment" ? d.sentColor : (COLORS[d.cluster] || "#999999");
+  }});
+}}
 
 var svg = d3.select("#viz").attr("width", W).attr("height", H)
             .attr("viewBox", [0, 0, W, H]);
@@ -432,9 +642,10 @@ var zoomBeh = d3.zoom().scaleExtent([0.3, 8]).on("zoom", function(ev) {{
 }});
 svg.call(zoomBeh);
 
-// ── Radius scale — floor kept high enough that short words almost always fit
-var maxFreq = d3.max(NODES, function(d) {{ return d.value; }}) || 1;
-var rScale = d3.scaleSqrt().domain([1, maxFreq]).range([16, 58]);
+// ── Radius scale — dynamic domain works for raw counts OR TF-IDF scores
+var vals = NODES.map(function(d) {{ return d.value; }});
+var minVal = d3.min(vals), maxVal = d3.max(vals);
+var rScale = d3.scaleSqrt().domain([minVal, maxVal]).range([16, 58]).clamp(true);
 NODES.forEach(function(d) {{ d.r = rScale(d.value); }});
 
 // ── Cluster "gravity well" centers, spread evenly around the canvas
@@ -496,9 +707,12 @@ node.append("circle")
   .attr("stroke-width", 1)
   .on("mouseenter", function(ev, d) {{
     d3.select(this).attr("stroke", "#333").attr("stroke-width", 2);
+    var sentLine = (d.sentiment !== null && d.sentiment !== undefined)
+      ? ("<br>Sentiment: " + (d.sentiment >= 0 ? "+" : "") + d.sentiment.toFixed(2))
+      : "";
     tooltip.style("opacity", 1).html(
       '<span class="swatch" style="background:' + (COLORS[d.cluster] || "#999") + '"></span>' +
-      '<b>' + d.name + '</b><br>Frequency: ' + d.value + '<br>' + d.clusterLabel
+      '<b>' + d.name + '</b><br>Frequency: ' + d.freq + sentLine + '<br>' + d.clusterLabel
     );
   }})
   .on("mousemove", function(ev) {{
@@ -597,7 +811,6 @@ function exportPNG() {{
     return html
 
 
-
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Settings")
@@ -606,6 +819,17 @@ with st.sidebar:
     min_freq   = st.slider("Min word occurrences",         1, 50,  5)
     min_edge   = st.slider("Min connection strength",      1, 20,  3)
     n_clusters = st.slider("Target number of clusters",    2, 10,  5)
+    st.markdown("---")
+    st.caption("🔤 Phrases & weighting")
+    use_phrases = st.checkbox("Detect common phrases (bigrams)", value=True, key="use_phrases")
+    min_bigram_freq = st.slider(
+        "Min phrase occurrences", 2, 20, 4, key="min_bigram_freq", disabled=not use_phrases
+    )
+    use_tfidf = st.checkbox(
+        "Use TF-IDF weighting instead of raw frequency", value=False, key="use_tfidf",
+        help="Sizes words/bubbles/nodes by how distinctive they are across verbatims, "
+             "instead of by raw occurrence count.",
+    )
     st.markdown("---")
     st.caption("ℹ️ After adding words here, click **Generate map** again to regenerate the analysis for newly excluded words.")
     user_extra_stops = st.text_area("Extra exclusion words (comma-sep):", "")
@@ -622,13 +846,39 @@ if uploaded_file:
     df  = pd.read_excel(uploaded_file)
     col = st.selectbox("Text column", df.columns)
 
+    # Placed via st.sidebar so it renders in the sidebar even though this
+    # code runs in the main body — it needs df.columns, which isn't known
+    # until a file is uploaded.
+    st.sidebar.markdown("---")
+    st.sidebar.caption("🔀 Group comparison")
+    group_col_choice = st.sidebar.selectbox(
+        "Compare groups by (optional)",
+        ["None"] + [c for c in df.columns if c != col],
+        key="group_col_choice",
+    )
+
     if st.button("🚀 Generate map", use_container_width=True):
         lemmatizer = load_lemmatizer()
+        sentiment_analyzer = load_sentiment_analyzer()
 
         with st.spinner("Analysing text and building graph…"):
 
             # Tokenise
             df["tokens"] = df[col].apply(lambda x: preprocess(x, lemmatizer, all_stops))
+
+            # ── Phrase detection: merge recurring adjacent word pairs into
+            #    single phrase tokens ("easy_apply") before anything downstream
+            #    counts/clusters/graphs them. ─────────────────────────────────
+            if use_phrases:
+                top_bigrams = extract_top_bigrams(df["tokens"].tolist(), min_freq=min_bigram_freq, top_n=30)
+                if top_bigrams:
+                    df["tokens"] = df["tokens"].apply(lambda toks: merge_bigrams(toks, top_bigrams))
+
+            # ── Sentiment: row-level VADER compound score on the ORIGINAL
+            #    text (punctuation/negation-aware), then averaged per word
+            #    across the rows that contain it. ────────────────────────────
+            row_sentiments = compute_row_sentiment(df[col].tolist(), sentiment_analyzer)
+            word_sent = compute_word_sentiment(df["tokens"].tolist(), row_sentiments)
 
             # Frequencies
             word_freq   = Counter(itertools.chain.from_iterable(df["tokens"]))
@@ -650,6 +900,16 @@ if uploaded_file:
                 st.warning("No connections found. Try lowering the sliders.")
                 st.stop()
 
+            # ── TF-IDF weighting (optional) — used only for VISUAL SIZING
+            #    (node/bubble size, word cloud weight); graph edges/thresholds
+            #    still use raw occurrence counts so "Min word occurrences"
+            #    keeps meaning what it says. ──────────────────────────────────
+            if use_tfidf:
+                tfidf_scores = compute_tfidf_scores(df["tokens"].tolist())
+                size_map = {n: tfidf_scores.get(n, 0.0001) for n in G.nodes()}
+            else:
+                size_map = {n: word_freq[n] for n in G.nodes()}
+
             # ── Louvain clustering ──────────────────────────────────────────
             best_p, best_d = None, 999
             for seed in range(30):
@@ -666,17 +926,39 @@ if uploaded_file:
 
             cluster_ids = sorted(set(best_p.values()))
 
+            # ── Group comparison data (optional) ────────────────────────────
+            group_freqs, group_counts, group_col = None, None, None
+            if group_col_choice != "None":
+                group_col = group_col_choice
+                group_freqs, group_counts = {}, {}
+                for val, sub in df.groupby(group_col_choice):
+                    toks = list(itertools.chain.from_iterable(sub["tokens"]))
+                    group_freqs[str(val)] = Counter(toks)
+                    group_counts[str(val)] = len(sub)
+
+            # ── Respondent-level lookup table (kept minimal) ────────────────
+            keep_cols = [col, "tokens"] + ([group_col_choice] if group_col_choice != "None" else [])
+            resp_df = df[keep_cols].copy()
+
             # ── Everything downstream (map html, word cloud, bubbles) only
-            #    needs word_freq / G / best_p / cluster_ids — cache those and
-            #    nothing more. The map/bubbles HTML is now built at RENDER
-            #    time (below), not here, because it depends on the current
-            #    cluster color_map — which the color pickers can change on
-            #    later reruns without needing a fresh "Generate map" click. ──
+            #    needs these — cache them and nothing more. The map/bubbles
+            #    HTML is built at RENDER time (below), not here, because it
+            #    depends on the current cluster color_map — which the color
+            #    pickers can change on later reruns without needing a fresh
+            #    "Generate map" click. ─────────────────────────────────────
             st.session_state["results"] = {
                 "word_freq": word_freq,
+                "size_map": size_map,
+                "word_sent": word_sent,
                 "G": G,
                 "best_p": best_p,
                 "cluster_ids": cluster_ids,
+                "group_freqs": group_freqs,
+                "group_counts": group_counts,
+                "group_col": group_col,
+                "resp_df": resp_df,
+                "text_col": col,
+                "using_tfidf": use_tfidf,
             }
             # New analysis → reset custom cluster colors to the default
             # palette (a prior custom pick may not even make sense if the
@@ -688,10 +970,18 @@ if uploaded_file:
 # ── Render from session_state — survives selectbox/slider/color-picker reruns
 if "results" in st.session_state:
     res = st.session_state["results"]
-    word_freq   = res["word_freq"]
-    G           = res["G"]
-    best_p      = res["best_p"]
-    cluster_ids = res["cluster_ids"]
+    word_freq    = res["word_freq"]
+    size_map     = res["size_map"]
+    word_sent    = res["word_sent"]
+    G            = res["G"]
+    best_p       = res["best_p"]
+    cluster_ids  = res["cluster_ids"]
+    group_freqs  = res.get("group_freqs")
+    group_counts = res.get("group_counts")
+    group_col    = res.get("group_col")
+    resp_df      = res.get("resp_df")
+    text_col     = res.get("text_col")
+    using_tfidf  = res.get("using_tfidf", False)
 
     # ── Custom cluster colors ────────────────────────────────────────────────
     with st.expander("🎨 Cluster colors", expanded=False):
@@ -704,17 +994,22 @@ if "results" in st.session_state:
                 default=f"Cluster {i+1}",
             )
             picked = picker_cols[i].color_picker(
-                f"C{i+1} · {top_word}",
+                f"C{i+1} · {display_label(top_word)}",
                 value=st.session_state["cluster_colors"].get(cid, CLUSTER_COLORS[i % len(CLUSTER_COLORS)]),
                 key=f"color_cluster_{cid}",
             )
             st.session_state["cluster_colors"][cid] = picked
 
     color_map = st.session_state["cluster_colors"]
-    html_map = build_html(G, best_p, word_freq, color_map, filename="semantic_map")
+    html_map = build_html(
+        G, best_p, word_freq, color_map,
+        size_map=size_map, word_sent=word_sent, filename="semantic_map",
+    )
 
     # ── Cluster summary cards ───────────────────────────────────────────────
     st.markdown("### Cluster overview")
+    if using_tfidf:
+        st.caption("Sizing by TF-IDF weight (enabled in the sidebar) — words distinctive to a cluster stand out, not just frequent ones.")
     card_cols = st.columns(len(cluster_ids))
     for i, cid in enumerate(cluster_ids):
         members = sorted(
@@ -722,22 +1017,54 @@ if "results" in st.session_state:
             key=lambda w: -word_freq[w],
         )
         col_bg = color_map[cid]
+        sent = cluster_avg_sentiment(members, word_freq, word_sent)
+        if sent is None:
+            sent_badge = ""
+        elif sent > 0.05:
+            sent_badge = f"🙂 +{sent:.2f}"
+        elif sent < -0.05:
+            sent_badge = f"🙁 {sent:.2f}"
+        else:
+            sent_badge = f"😐 {sent:+.2f}"
         card_cols[i].markdown(
             f"""<div style="background:{col_bg};color:#fff;padding:12px 10px;
                 border-radius:10px;border-left:5px solid rgba(0,0,0,0.2);">
                 <div style="font-size:.75em;opacity:.8;letter-spacing:.06em;">CLUSTER {i+1}</div>
                 <div style="font-weight:bold;font-size:1.05em;margin:4px 0;">
-                  {members[0].upper() if members else "—"}
+                  {display_label(members[0]).upper() if members else "—"}
                 </div>
                 <div style="font-size:.72em;line-height:1.4;opacity:.9;">
-                  {", ".join(members[1:5])}{"…" if len(members) > 5 else ""}
+                  {", ".join(display_label(w) for w in members[1:5])}{"…" if len(members) > 5 else ""}
                 </div>
                 <div style="font-size:.7em;margin-top:6px;opacity:.75;">
-                  {len(members)} words
+                  {len(members)} words {("· " + sent_badge) if sent_badge else ""}
                 </div>
             </div>""",
             unsafe_allow_html=True,
         )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Sentiment by cluster ────────────────────────────────────────────────
+    if word_sent:
+        st.markdown("### 😊 Sentiment by Cluster")
+        st.caption("Average VADER sentiment of respondent rows mentioning each cluster's words (−1 = negative, +1 = positive).")
+        sent_rows = []
+        for i, cid in enumerate(cluster_ids):
+            members = [w for w, c in best_p.items() if c == cid]
+            s = cluster_avg_sentiment(members, word_freq, word_sent)
+            sent_rows.append((f"C{i+1} · {display_label(max(members, key=lambda w: word_freq[w]))}" if members else f"C{i+1}", s or 0.0))
+        fig, ax = plt.subplots(figsize=(9, max(1.6, 0.5 * len(sent_rows))))
+        labels = [r[0] for r in sent_rows]
+        scores = [r[1] for r in sent_rows]
+        bar_colors = [sentiment_to_color(s) for s in scores]
+        ax.barh(labels, scores, color=bar_colors)
+        ax.axvline(0, color="#333", linewidth=0.8)
+        ax.set_xlim(-1, 1)
+        ax.set_xlabel("Average sentiment")
+        ax.invert_yaxis()
+        st.pyplot(fig)
+        plt.close(fig)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -763,12 +1090,12 @@ if "results" in st.session_state:
     font_choice = wc_col2.selectbox("Font", list(FONT_OPTIONS.keys()), key="cloud_font")
 
     if cloud_scope == "Entire sample":
-        cloud_freqs = dict(word_freq)
+        cloud_freqs = {w: size_map.get(w, word_freq[w]) for w in word_freq}
         focus_cid = None
     else:
         idx = int(cloud_scope.split(" ")[1]) - 1
         focus_cid = cluster_ids[idx]
-        cloud_freqs = {w: word_freq[w] for w, c in best_p.items() if c == focus_cid}
+        cloud_freqs = {w: size_map.get(w, word_freq[w]) for w, c in best_p.items() if c == focus_cid}
 
     if cloud_freqs:
         font_path = FONT_OPTIONS[font_choice]
@@ -776,30 +1103,39 @@ if "results" in st.session_state:
             st.caption(f"⚠️ '{font_choice}' font file not found at `{font_path}` — using the default font instead. Add the .ttf there to enable it.")
             font_path = None
 
+        # WordCloud needs the words it displays as keys — swap in display
+        # labels (spaces instead of underscores for phrase tokens) here, and
+        # keep a reverse lookup so the color function can still find each
+        # word's original cluster/frequency data.
+        display_freqs = {display_label(w): v for w, v in cloud_freqs.items()}
+        disp_to_orig = {display_label(w): w for w in cloud_freqs}
+
         wc_kwargs = dict(
             width=1100, height=550, background_color="white", prefer_horizontal=0.9,
         )
         if font_path:
             wc_kwargs["font_path"] = font_path
 
-        wc = WordCloud(**wc_kwargs).generate_from_frequencies(cloud_freqs)
+        wc = WordCloud(**wc_kwargs).generate_from_frequencies(display_freqs)
 
         # ── Recolor to match cluster colors, consistent with the map/bubbles.
         if focus_cid is None:
             # Entire sample: solid color per word's own cluster.
             def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
-                cid = best_p.get(word)
+                orig = disp_to_orig.get(word, word)
+                cid = best_p.get(orig)
                 return rgb_str(color_map.get(cid, "#999999"))
         else:
             # Single cluster focus: shades of that one cluster's color,
-            # darker for more frequent words — keeps everything readably
-            # within the cluster's hue instead of introducing new colors,
-            # while frequency is still visible at a glance.
+            # darker for more frequent/weighted words — keeps everything
+            # readably within the cluster's hue instead of introducing new
+            # colors, while relative importance is still visible at a glance.
             base_color = color_map[focus_cid]
             freqs = list(cloud_freqs.values())
             fmin, fmax = min(freqs), max(freqs)
             def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
-                f = cloud_freqs.get(word, fmin)
+                orig = disp_to_orig.get(word, word)
+                f = cloud_freqs.get(orig, fmin)
                 t = 0.5 if fmax == fmin else (f - fmin) / (fmax - fmin)
                 return shade_rgb_str(base_color, 0.3 + t * 0.55)
 
@@ -828,7 +1164,7 @@ if "results" in st.session_state:
 
     # ── Cluster bubbles (circle-packing, replaces the old word tree) ─────────
     st.markdown("### 🔵 Cluster Bubbles")
-    st.caption("Word size = frequency · color = cluster · drag a bubble to move it · scroll/drag background to zoom & pan")
+    st.caption("Word size = frequency (or TF-IDF, if enabled) · color = cluster · drag a bubble to move it · scroll/drag background to zoom & pan")
     bubble_options = ["Entire sample"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
     bubble_scope = st.selectbox("Show bubbles for:", bubble_options, key="bubble_scope")
 
@@ -836,7 +1172,10 @@ if "results" in st.session_state:
         "cluster_bubbles_all" if bubble_scope == "Entire sample"
         else f"cluster_bubbles_{bubble_scope.replace(' ', '_').lower()}"
     )
-    bubble_html = build_bubbles_html(word_freq, best_p, cluster_ids, color_map, bubble_scope, filename=bubble_fname)
+    bubble_html = build_bubbles_html(
+        word_freq, best_p, cluster_ids, color_map, bubble_scope,
+        size_map=size_map, word_sent=word_sent, filename=bubble_fname,
+    )
     if bubble_html:
         st.components.v1.html(bubble_html, height=650, scrolling=False)
         st.download_button(
@@ -849,3 +1188,163 @@ if "results" in st.session_state:
         )
     else:
         st.info("No words to display for this selection.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Group comparison & diff view ─────────────────────────────────────────
+    if group_freqs:
+        st.markdown("### 🔀 Group Comparison & Diff View")
+        gnames = list(group_freqs.keys())
+        if len(gnames) < 2:
+            st.info(f"Only one group value found in '{group_col}' — need at least two to compare.")
+        else:
+            gc1, gc2 = st.columns(2)
+            group_a = gc1.selectbox("Group A", gnames, index=0, key="diff_group_a")
+            default_b_idx = 1 if len(gnames) > 1 else 0
+            group_b = gc2.selectbox("Group B", gnames, index=default_b_idx, key="diff_group_b")
+
+            if group_a == group_b:
+                st.info("Pick two different groups to compare.")
+            else:
+                freqs_a, freqs_b = group_freqs[group_a], group_freqs[group_b]
+                total_a = sum(freqs_a.values()) or 1
+                total_b = sum(freqs_b.values()) or 1
+                eps = 0.5
+                diffs = []
+                for w in set(freqs_a) | set(freqs_b):
+                    a, b = freqs_a.get(w, 0), freqs_b.get(w, 0)
+                    if a + b < 3:
+                        continue
+                    rate_a = (a + eps) / (total_a + eps)
+                    rate_b = (b + eps) / (total_b + eps)
+                    diffs.append((w, math.log2(rate_a / rate_b), a, b))
+                diffs.sort(key=lambda x: x[1])
+
+                if not diffs:
+                    st.info("Not enough overlapping vocabulary between these two groups to compare.")
+                else:
+                    top_b = diffs[:12]
+                    top_a = list(reversed(diffs[-12:]))
+                    plot_rows = top_a + top_b
+                    labels = [display_label(w) for w, _, _, _ in plot_rows]
+                    scores = [s for _, s, _, _ in plot_rows]
+                    bar_colors = ["#0085AF" if s > 0 else "#C62F4B" for s in scores]
+
+                    fig, ax = plt.subplots(figsize=(9, max(3, 0.32 * len(plot_rows))))
+                    y = list(range(len(plot_rows)))
+                    ax.barh(y, scores, color=bar_colors)
+                    ax.set_yticks(y)
+                    ax.set_yticklabels(labels, fontsize=9)
+                    ax.invert_yaxis()
+                    ax.axvline(0, color="#333", linewidth=0.8)
+                    ax.set_xlabel(f"← more typical of {group_b}     |     more typical of {group_a} →")
+                    ax.set_title(f"Word usage skew: {group_a} vs {group_b}")
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                wc_a, wc_b = st.columns(2)
+                wc_a.markdown(f"**Top words — {group_a}** ({group_counts[group_a]} rows)")
+                wc_a.dataframe(
+                    pd.DataFrame(freqs_a.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
+                    hide_index=True, use_container_width=True,
+                )
+                wc_b.markdown(f"**Top words — {group_b}** ({group_counts[group_b]} rows)")
+                wc_b.dataframe(
+                    pd.DataFrame(freqs_b.most_common(10), columns=["word", "count"]).assign(word=lambda d: d["word"].map(display_label)),
+                    hide_index=True, use_container_width=True,
+                )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Hierarchical drill-down ──────────────────────────────────────────────
+    st.markdown("### 🔬 Hierarchical Drill-Down")
+    st.caption("Zoom into one cluster and re-run clustering on just its words to reveal sub-structure.")
+    drill_options = ["None"] + [f"Cluster {i+1}" for i in range(len(cluster_ids))]
+    drill_choice = st.selectbox("Drill into:", drill_options, key="drill_choice")
+
+    if drill_choice != "None":
+        idx = int(drill_choice.split(" ")[1]) - 1
+        cid = cluster_ids[idx]
+        members = [w for w, c in best_p.items() if c == cid]
+        subG = G.subgraph(members).copy()
+
+        if subG.number_of_nodes() < 4 or subG.number_of_edges() < 2:
+            st.info("Not enough internal structure in this cluster to sub-divide.")
+        else:
+            sub_partition = community_louvain.best_partition(subG, random_state=0)
+            sub_ids = sorted(set(sub_partition.values()))
+            sub_color_map = {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(sub_ids)}
+
+            st.write(f"**{drill_choice}** split into {len(sub_ids)} sub-groups:")
+            sub_cols = st.columns(len(sub_ids))
+            for i, scid in enumerate(sub_ids):
+                smembers = sorted([w for w, c in sub_partition.items() if c == scid], key=lambda w: -word_freq.get(w, 0))
+                sub_cols[i].markdown(
+                    f"""<div style="background:{sub_color_map[scid]};color:#fff;padding:8px;border-radius:8px;font-size:.75em;">
+                    <b>{display_label(smembers[0]).upper() if smembers else '—'}</b><br>{", ".join(display_label(w) for w in smembers[1:5])}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+            sub_html = build_html(
+                subG, sub_partition, word_freq, sub_color_map,
+                size_map=size_map, word_sent=word_sent,
+                filename=f"drilldown_{drill_choice.replace(' ', '_').lower()}",
+            )
+            st.components.v1.html(sub_html, height=520, scrolling=False)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Word co-occurrence table / export ────────────────────────────────────
+    st.markdown("### 🔗 Word Co-occurrence Table")
+    edge_rows = [
+        {"word_1": display_label(u), "word_2": display_label(v), "co_occurrences": d.get("weight", 1)}
+        for u, v, d in G.edges(data=True)
+    ]
+    edge_df = pd.DataFrame(edge_rows).sort_values("co_occurrences", ascending=False).reset_index(drop=True)
+    st.dataframe(edge_df, use_container_width=True, height=300)
+
+    freq_df = pd.DataFrame(
+        [{"word": display_label(w), "frequency": word_freq[w], "cluster": best_p[w] + 1} for w in G.nodes()]
+    ).sort_values("frequency", ascending=False).reset_index(drop=True)
+
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+        edge_df.to_excel(writer, index=False, sheet_name="co_occurrences")
+        freq_df.to_excel(writer, index=False, sheet_name="word_frequency")
+    st.download_button(
+        "💾 Download co-occurrence data (XLSX)",
+        data=xlsx_buf.getvalue(),
+        file_name="word_cooccurrence.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="download_cooc_xlsx",
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Respondent-level drill-down ──────────────────────────────────────────
+    st.markdown("### 🔎 Respondent-level Drill-down")
+    if resp_df is not None and text_col is not None:
+        all_words = sorted(G.nodes(), key=lambda w: -word_freq.get(w, 0))
+        pick_word = st.selectbox(
+            "Show verbatims containing:",
+            all_words,
+            format_func=display_label,
+            key="drilldown_word",
+        )
+        mask = resp_df["tokens"].apply(lambda toks: pick_word in toks)
+        matches = resp_df.loc[mask]
+        st.write(f"**{len(matches)}** respondent(s) mention *{display_label(pick_word)}*")
+        show_cols = [text_col] + ([group_col] if group_col else [])
+        st.dataframe(matches[show_cols], use_container_width=True, height=300)
+        if len(matches):
+            csv_buf = matches[show_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "💾 Download matching verbatims (CSV)",
+                data=csv_buf,
+                file_name=f"verbatims_{pick_word}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_verbatims_csv",
+            )
